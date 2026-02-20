@@ -1,216 +1,1206 @@
-"""Agent Kanban - Task Dispatcher (FastAPI Backend)"""
+"""Agent Kanban backend - productionized dispatcher + worker execution loop.
+
+Key capabilities:
+- Automatic background dispatch loop (Ralph loop)
+- Real Claude/Codex CLI worker execution
+- Plan approval -> automatic decomposition -> automatic dispatch
+- Adversarial review flow
+- Task execution protocol endpoints (claim/heartbeat/complete/fail)
+- Timeline/attempt/event observability
+"""
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from filelock import FileLock
 from pydantic import BaseModel, Field
+from dispatcher import DispatchRuntime
+from worker_runner import WorkerRunner
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("agentkanban")
 
 # --- Config ---
 DATA_DIR = Path(__file__).parent / "data"
 TASKS_FILE = DATA_DIR / "dev-tasks.json"
 LOCK_FILE = DATA_DIR / "dev-task.lock"
 
+DISPATCH_INTERVAL_SEC = int(os.getenv("DISPATCH_INTERVAL_SEC", "5"))
+HEALTH_INTERVAL_SEC = int(os.getenv("HEALTH_INTERVAL_SEC", "30"))
+WORKER_HEARTBEAT_TIMEOUT_SEC = int(os.getenv("WORKER_HEARTBEAT_TIMEOUT_SEC", "120"))
+MAX_REVIEW_ROUNDS = int(os.getenv("MAX_REVIEW_ROUNDS", "3"))
+
+CLAUDE_CLI = os.getenv("CLAUDE_CLI", "claude")
+CODEX_CLI = os.getenv("CODEX_CLI", "codex")
+
+AUTO_RETRY_DELAY_SEC = int(os.getenv("AUTO_RETRY_DELAY_SEC", "10"))
+WORKER_COOLDOWN_SEC = int(os.getenv("WORKER_COOLDOWN_SEC", "60"))
+WORKER_MAX_CONSECUTIVE_FAILURES = int(os.getenv("WORKER_MAX_CONSECUTIVE_FAILURES", "5"))
+
+# real | dry-run
+WORKER_EXEC_MODE = os.getenv("WORKER_EXEC_MODE", "real").lower()
+
 # --- Routing rules ---
 ROUTING_RULES = [
-    {"task_type": "feature", "keywords": ["开发", "实现", "新增", "添加", "创建", "implement", "add", "create"], "preferred_engine": "claude", "fallback_engine": "codex"},
-    {"task_type": "review", "keywords": ["review", "审查", "检查", "code review", "PR review"], "preferred_engine": "codex", "fallback_engine": "claude"},
-    {"task_type": "refactor", "keywords": ["重构", "优化", "refactor", "cleanup", "整理"], "preferred_engine": "codex", "fallback_engine": "claude"},
-    {"task_type": "bugfix", "keywords": ["修复", "bug", "fix", "错误", "异常", "crash"], "preferred_engine": "claude", "fallback_engine": "codex"},
-    {"task_type": "analysis", "keywords": ["分析", "审计", "analyze", "audit", "检测", "扫描"], "preferred_engine": "codex", "fallback_engine": "claude"},
-    {"task_type": "plan", "keywords": ["计划", "拆解", "设计", "plan", "design", "架构"], "preferred_engine": "claude", "fallback_engine": "codex"},
+    {
+        "task_type": "feature",
+        "keywords": ["开发", "实现", "新增", "添加", "创建", "implement", "add", "create"],
+        "preferred_engine": "claude",
+        "fallback_engine": "codex",
+    },
+    {
+        "task_type": "review",
+        "keywords": ["review", "审查", "检查", "code review", "PR review"],
+        "preferred_engine": "codex",
+        "fallback_engine": "claude",
+    },
+    {
+        "task_type": "refactor",
+        "keywords": ["重构", "优化", "refactor", "cleanup", "整理"],
+        "preferred_engine": "codex",
+        "fallback_engine": "claude",
+    },
+    {
+        "task_type": "bugfix",
+        "keywords": ["修复", "bug", "fix", "错误", "异常", "crash"],
+        "preferred_engine": "claude",
+        "fallback_engine": "codex",
+    },
+    {
+        "task_type": "analysis",
+        "keywords": ["分析", "审计", "analyze", "audit", "检测", "扫描"],
+        "preferred_engine": "codex",
+        "fallback_engine": "claude",
+    },
+    {
+        "task_type": "plan",
+        "keywords": ["计划", "拆解", "设计", "plan", "design", "架构"],
+        "preferred_engine": "claude",
+        "fallback_engine": "codex",
+    },
 ]
+
+PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+TASK_TYPES = {"feature", "bugfix", "review", "refactor", "analysis", "plan", "audit"}
 
 # --- In-memory worker state ---
 WORKERS = [
     {
-        "id": "worker-0", "engine": "claude", "port": 5200,
-        "worktree_path": "/app/worktrees/worker-0", "status": "idle",
+        "id": "worker-0",
+        "engine": "claude",
+        "port": 5200,
+        "worktree_path": "/app/worktrees/worker-0",
+        "status": "idle",
         "capabilities": ["feature", "bugfix", "plan"],
-        "current_task_id": None, "pid": None, "started_at": None,
-        "total_tasks_completed": 42,
-        "health": {"last_heartbeat": datetime.now(timezone.utc).isoformat(), "consecutive_failures": 0, "avg_task_duration_ms": 240000},
+        "current_task_id": None,
+        "pid": None,
+        "started_at": None,
+        "total_tasks_completed": 0,
+        "lease_id": None,
+        "last_seen_at": None,
+        "cli_available": False,
+        "health": {
+            "last_heartbeat": None,
+            "consecutive_failures": 0,
+            "avg_task_duration_ms": 0,
+        },
     },
     {
-        "id": "worker-1", "engine": "claude", "port": 5201,
-        "worktree_path": "/app/worktrees/worker-1", "status": "idle",
+        "id": "worker-1",
+        "engine": "claude",
+        "port": 5201,
+        "worktree_path": "/app/worktrees/worker-1",
+        "status": "idle",
         "capabilities": ["feature", "bugfix", "plan"],
-        "current_task_id": None, "pid": None, "started_at": None,
-        "total_tasks_completed": 38,
-        "health": {"last_heartbeat": datetime.now(timezone.utc).isoformat(), "consecutive_failures": 0, "avg_task_duration_ms": 200000},
+        "current_task_id": None,
+        "pid": None,
+        "started_at": None,
+        "total_tasks_completed": 0,
+        "lease_id": None,
+        "last_seen_at": None,
+        "cli_available": False,
+        "health": {
+            "last_heartbeat": None,
+            "consecutive_failures": 0,
+            "avg_task_duration_ms": 0,
+        },
     },
     {
-        "id": "worker-2", "engine": "claude", "port": 5202,
-        "worktree_path": "/app/worktrees/worker-2", "status": "idle",
+        "id": "worker-2",
+        "engine": "claude",
+        "port": 5202,
+        "worktree_path": "/app/worktrees/worker-2",
+        "status": "idle",
         "capabilities": ["feature", "bugfix", "plan"],
-        "current_task_id": None, "pid": None, "started_at": None,
-        "total_tasks_completed": 35,
-        "health": {"last_heartbeat": datetime.now(timezone.utc).isoformat(), "consecutive_failures": 0, "avg_task_duration_ms": 260000},
+        "current_task_id": None,
+        "pid": None,
+        "started_at": None,
+        "total_tasks_completed": 0,
+        "lease_id": None,
+        "last_seen_at": None,
+        "cli_available": False,
+        "health": {
+            "last_heartbeat": None,
+            "consecutive_failures": 0,
+            "avg_task_duration_ms": 0,
+        },
     },
     {
-        "id": "worker-3", "engine": "codex", "port": 5203,
-        "worktree_path": "/app/worktrees/worker-3", "status": "idle",
+        "id": "worker-3",
+        "engine": "codex",
+        "port": 5203,
+        "worktree_path": "/app/worktrees/worker-3",
+        "status": "idle",
         "capabilities": ["review", "refactor", "analysis", "audit"],
-        "current_task_id": None, "pid": None, "started_at": None,
-        "total_tasks_completed": 28,
-        "health": {"last_heartbeat": datetime.now(timezone.utc).isoformat(), "consecutive_failures": 0, "avg_task_duration_ms": 120000},
+        "current_task_id": None,
+        "pid": None,
+        "started_at": None,
+        "total_tasks_completed": 0,
+        "lease_id": None,
+        "last_seen_at": None,
+        "cli_available": False,
+        "health": {
+            "last_heartbeat": None,
+            "consecutive_failures": 0,
+            "avg_task_duration_ms": 0,
+        },
     },
     {
-        "id": "worker-4", "engine": "codex", "port": 5204,
-        "worktree_path": "/app/worktrees/worker-4", "status": "idle",
+        "id": "worker-4",
+        "engine": "codex",
+        "port": 5204,
+        "worktree_path": "/app/worktrees/worker-4",
+        "status": "idle",
         "capabilities": ["review", "refactor", "analysis", "audit"],
-        "current_task_id": None, "pid": None, "started_at": None,
-        "total_tasks_completed": 25,
-        "health": {"last_heartbeat": datetime.now(timezone.utc).isoformat(), "consecutive_failures": 0, "avg_task_duration_ms": 110000},
+        "current_task_id": None,
+        "pid": None,
+        "started_at": None,
+        "total_tasks_completed": 0,
+        "lease_id": None,
+        "last_seen_at": None,
+        "cli_available": False,
+        "health": {
+            "last_heartbeat": None,
+            "consecutive_failures": 0,
+            "avg_task_duration_ms": 0,
+        },
     },
 ]
 
 ENGINE_HEALTH = {"claude": True, "codex": True}
 
+# in-memory runtime handles (not persisted)
+RUNTIME_EXECUTIONS: dict[str, asyncio.Task] = {}
+BACKGROUND_TASKS: list[asyncio.Task] = []
+DISPATCH_RUNTIME: Optional[DispatchRuntime] = None
+DISPATCH_ENABLED: bool = True
+DISPATCH_STATS: dict[str, Any] = {
+    "last_cycle_at": None,
+    "cycle_count": 0,
+}
+
+# Worker log buffer for real-time streaming (worker_id -> list of log lines)
+WORKER_LOGS: dict[str, list[dict]] = {}
+
+WORKER_RUNNER = WorkerRunner(
+    claude_cli=CLAUDE_CLI,
+    codex_cli=CODEX_CLI,
+    exec_mode=WORKER_EXEC_MODE,
+)
+
 
 # --- WebSocket connection manager ---
 class ConnectionManager:
     def __init__(self):
-        self.active: List[WebSocket] = []
+        self.active: list[WebSocket] = []
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active.append(ws)
 
     def disconnect(self, ws: WebSocket):
-        self.active.remove(ws)
+        if ws in self.active:
+            self.active.remove(ws)
 
     async def broadcast(self, message: dict):
         for ws in list(self.active):
             try:
                 await ws.send_json(message)
             except Exception:
-                self.active.remove(ws)
+                if ws in self.active:
+                    self.active.remove(ws)
 
 
 ws_manager = ConnectionManager()
 
 
-# --- File helpers ---
+# --- Models ---
+class PlanQuestion(BaseModel):
+    question: str
+    options: list[str]
+    selected: Optional[int] = None
+
+
+class ReviewIssue(BaseModel):
+    severity: str
+    file: str
+    line: int
+    description: str
+    suggestion: str
+
+
+class ReviewResult(BaseModel):
+    issues: list[ReviewIssue] = Field(default_factory=list)
+    summary: Optional[str] = None
+
+
+class TaskCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(default="", max_length=5000)
+    engine: Literal["auto", "claude", "codex"] = "auto"
+    plan_mode: bool = False
+    priority: Literal["high", "medium", "low"] = "medium"
+    task_type: Optional[Literal["feature", "bugfix", "review", "refactor", "analysis", "plan", "audit"]] = None
+    depends_on: list[str] = Field(default_factory=list)
+    plan_questions: list[PlanQuestion] = Field(default_factory=list)
+
+
+class TaskUpdate(BaseModel):
+    status: Optional[Literal[
+        "pending", "in_progress", "plan_review", "blocked_by_subtasks",
+        "reviewing", "completed", "failed", "cancelled"
+    ]] = None
+    title: Optional[str] = Field(default=None, max_length=200)
+    description: Optional[str] = Field(default=None, max_length=5000)
+    priority: Optional[Literal["high", "medium", "low"]] = None
+    engine: Optional[Literal["auto", "claude", "codex"]] = None
+    routed_engine: Optional[Literal["claude", "codex"]] = None
+    plan_mode: Optional[bool] = None
+    plan_content: Optional[str] = None
+    plan_questions: Optional[list[PlanQuestion]] = None
+    assigned_worker: Optional[str] = None
+    error_log: Optional[str] = None
+    commit_ids: Optional[list[str]] = None
+    review_status: Optional[str] = None
+    review_engine: Optional[str] = None
+    review_result: Optional[ReviewResult] = None
+    depends_on: Optional[list[str]] = None
+    sub_tasks: Optional[list[str]] = None
+    worktree_branch: Optional[str] = None
+    retry_count: Optional[int] = None
+    max_retries: Optional[int] = None
+    blocked_reason: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    review_round: Optional[int] = None
+    last_exit_code: Optional[int] = None
+
+
+class DispatchRequest(BaseModel):
+    worker_id: Optional[str] = None
+    engine: Optional[str] = Field(default=None, pattern="^(claude|codex)$")
+    allow_plan_tasks: bool = False
+
+
+class EngineHealthUpdate(BaseModel):
+    healthy: bool
+
+
+class PlanApproval(BaseModel):
+    approved: bool
+    feedback: Optional[str] = None
+
+
+class SubTaskInput(BaseModel):
+    title: str
+    description: str = ""
+    task_type: str = "feature"
+    engine: str = "auto"
+    priority: str = "medium"
+
+
+class DecomposeRequest(BaseModel):
+    sub_tasks: list[SubTaskInput]
+
+
+class WorkerUpdate(BaseModel):
+    status: Optional[str] = None
+    current_task_id: Optional[str] = None
+
+
+class ClaimRequest(BaseModel):
+    worker_id: str
+
+
+class HeartbeatRequest(BaseModel):
+    worker_id: str
+    lease_id: Optional[str] = None
+
+
+class CompleteRequest(BaseModel):
+    worker_id: str
+    lease_id: Optional[str] = None
+    commit_ids: list[str] = Field(default_factory=list)
+    summary: Optional[str] = None
+
+
+class FailRequest(BaseModel):
+    worker_id: str
+    lease_id: Optional[str] = None
+    error_log: str
+    exit_code: Optional[int] = None
+
+
+class EventAckRequest(BaseModel):
+    by: Optional[str] = None
+
+
+# --- Helpers ---
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_iso(dt: Optional[str]) -> Optional[datetime]:
+    if not dt:
+        return None
+    try:
+        return datetime.fromisoformat(dt)
+    except (ValueError, TypeError):
+        return None
+
+
+def _gen_event_id() -> str:
+    return f"evt-{uuid.uuid4().hex[:10]}"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _worker_by_id(worker_id: str) -> Optional[dict]:
+    for worker in WORKERS:
+        if worker["id"] == worker_id:
+            return worker
+    return None
+
+
+def _ensure_task_shape(task: dict):
+    task.setdefault("plan_questions", [])
+    task.setdefault("retry_count", 0)
+    task.setdefault("max_retries", 3)
+    task.setdefault("routed_engine", task.get("routed_engine") or route_task(task))
+    task.setdefault("attempts", [])
+    task.setdefault("timeline", [])
+    task.setdefault("blocked_reason", None)
+    task.setdefault("fallback_reason", None)
+    task.setdefault("review_round", 0)
+    task.setdefault("last_exit_code", None)
+
+
 def read_tasks() -> dict:
     lock = FileLock(str(LOCK_FILE))
     with lock:
-        return json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+        data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+
+    data.setdefault("tasks", [])
+    data.setdefault("events", [])
+    data.setdefault("meta", {})
+    data.setdefault("schema_version", 2)
+    for task in data["tasks"]:
+        _ensure_task_shape(task)
+    return data
 
 
 def write_tasks(data: dict):
+    tasks = data.get("tasks", [])
+    completed = sum(1 for x in tasks if x.get("status") == "completed")
+    failed = sum(1 for x in tasks if x.get("status") == "failed")
+
+    data.setdefault("meta", {})
+    data["meta"]["last_updated"] = _now()
+    data["meta"]["total_completed"] = completed
+    data["meta"]["success_rate"] = round(completed / max(completed + failed, 1), 2)
+    data["meta"]["claude_tasks"] = sum(1 for t in tasks if t.get("routed_engine") == "claude")
+    data["meta"]["codex_tasks"] = sum(1 for t in tasks if t.get("routed_engine") == "codex")
+    data["schema_version"] = 2
+
     lock = FileLock(str(LOCK_FILE))
     with lock:
-        data["meta"]["last_updated"] = datetime.now(timezone.utc).isoformat()
-        TASKS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        TASKS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def gen_task_id(data: dict) -> str:
     max_num = 0
-    for t in data["tasks"]:
+    for task in data.get("tasks", []):
         try:
-            num = int(t["id"].replace("task-", ""))
-            if num > max_num:
-                max_num = num
-        except ValueError:
-            pass
+            num = int(str(task["id"]).replace("task-", ""))
+            max_num = max(max_num, num)
+        except (ValueError, KeyError):
+            continue
     return f"task-{max_num + 1:03d}"
 
 
+def classify_task_type(title: str, description: str) -> str:
+    text = f"{title} {description}".lower()
+    for rule in ROUTING_RULES:
+        if any(keyword.lower() in text for keyword in rule["keywords"]):
+            return rule["task_type"]
+    return "feature"
+
+
 def route_task(task: dict) -> str:
-    """Smart routing: choose the best engine for a task."""
     if task.get("engine") and task["engine"] != "auto":
         return task["engine"]
 
     task_type = task.get("task_type", "feature")
     engine_map = {
-        "feature": "claude", "bugfix": "claude", "plan": "claude",
-        "review": "codex", "refactor": "codex", "analysis": "codex", "audit": "codex",
+        "feature": "claude",
+        "bugfix": "claude",
+        "plan": "claude",
+        "test": "claude",
+        "review": "codex",
+        "refactor": "codex",
+        "analysis": "codex",
+        "audit": "codex",
     }
     preferred = engine_map.get(task_type, "claude")
+    if ENGINE_HEALTH.get(preferred, False):
+        return preferred
 
-    if not ENGINE_HEALTH.get(preferred, False):
-        fallback = "codex" if preferred == "claude" else "claude"
-        if ENGINE_HEALTH.get(fallback, False):
-            return fallback
+    fallback = "codex" if preferred == "claude" else "claude"
+    if ENGINE_HEALTH.get(fallback, False):
+        task["fallback_reason"] = f"{preferred}_unhealthy"
+        return fallback
+
+    task["fallback_reason"] = "no_healthy_engine"
     return preferred
 
 
-def classify_task_type(title: str, description: str) -> str:
-    """Classify task type from keywords."""
-    text = f"{title} {description}".lower()
-    for rule in ROUTING_RULES:
-        if any(kw in text for kw in rule["keywords"]):
-            return rule["task_type"]
-    return "feature"
+def find_task(data: dict, task_id: str) -> Optional[dict]:
+    for task in data.get("tasks", []):
+        if task.get("id") == task_id:
+            return task
+    return None
 
 
-# --- Pydantic models ---
-class TaskCreate(BaseModel):
-    title: str
-    description: str = ""
-    engine: str = "auto"
-    plan_mode: bool = False
-    priority: str = "medium"
-    task_type: Optional[str] = None
+def dependencies_satisfied(task: dict, data: dict) -> bool:
+    for dep in task.get("depends_on", []) or []:
+        dep_task = find_task(data, dep)
+        if not dep_task or dep_task.get("status") != "completed":
+            return False
+    return True
 
 
-class TaskUpdate(BaseModel):
-    status: Optional[str] = None
-    title: Optional[str] = None
-    description: Optional[str] = None
-    priority: Optional[str] = None
-    engine: Optional[str] = None
-    plan_mode: Optional[bool] = None
-    plan_content: Optional[str] = None
-    assigned_worker: Optional[str] = None
-    error_log: Optional[str] = None
+def add_timeline(task: dict, event: str, detail: Optional[dict] = None):
+    task.setdefault("timeline", [])
+    task["timeline"].append({
+        "at": _now(),
+        "event": event,
+        "detail": detail or {},
+    })
 
 
-# --- FastAPI app ---
+def _append_attempt(task: dict, worker_id: str, lease_id: str):
+    task.setdefault("attempts", [])
+    attempt_no = len(task["attempts"]) + 1
+    task["attempts"].append({
+        "attempt": attempt_no,
+        "worker_id": worker_id,
+        "engine": task.get("routed_engine") or task.get("engine"),
+        "lease_id": lease_id,
+        "started_at": _now(),
+        "completed_at": None,
+        "status": "running",
+        "exit_code": None,
+        "error_log": None,
+        "commit_ids": [],
+    })
+
+
+def _complete_attempt(task: dict, success: bool, *, exit_code: Optional[int], error_log: Optional[str], commit_ids: list[str]):
+    attempts = task.get("attempts", [])
+    if not attempts:
+        return
+    attempt = attempts[-1]
+    attempt["completed_at"] = _now()
+    attempt["status"] = "completed" if success else "failed"
+    attempt["exit_code"] = exit_code
+    attempt["error_log"] = error_log
+    attempt["commit_ids"] = commit_ids
+
+
+def emit_event(data: dict, event_type: str, *, level: str = "info", task_id: Optional[str] = None, worker_id: Optional[str] = None, message: str = "", meta: Optional[dict] = None) -> dict:
+    event = {
+        "id": _gen_event_id(),
+        "type": event_type,
+        "level": level,
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "message": message,
+        "meta": meta or {},
+        "created_at": _now(),
+        "acknowledged": False,
+        "acknowledged_at": None,
+        "acknowledged_by": None,
+    }
+    data.setdefault("events", []).append(event)
+    if len(data["events"]) > 2000:
+        data["events"] = data["events"][-2000:]
+    return event
+
+
+async def broadcast_task_event(task: dict, event_type: str):
+    await ws_manager.broadcast({"type": event_type, "task": task})
+
+
+async def broadcast_event(event: dict):
+    await ws_manager.broadcast({"type": "event_created", "event": event})
+
+
+def maybe_trigger_adversarial_review(task: dict, data: dict) -> Optional[dict]:
+    if task.get("task_type") not in {"feature", "bugfix", "refactor"}:
+        return None
+
+    existing = [
+        t for t in data["tasks"]
+        if t.get("parent_task_id") == task["id"] and t.get("task_type") == "review"
+    ]
+    if existing:
+        return None
+
+    review_engine = "codex" if (task.get("routed_engine") or task.get("engine")) == "claude" else "claude"
+    review_task = {
+        "id": gen_task_id(data),
+        "title": f"Review: {task['title']}",
+        "description": f"对任务 {task['id']} 的代码做对抗式 Review",
+        "status": "pending",
+        "priority": task.get("priority", "medium"),
+        "task_type": "review",
+        "engine": "auto",
+        "routed_engine": review_engine,
+        "parent_task_id": task["id"],
+        "sub_tasks": [],
+        "depends_on": [task["id"]],
+        "plan_mode": False,
+        "plan_content": None,
+        "plan_questions": [],
+        "assigned_worker": None,
+        "worktree_branch": None,
+        "review_status": None,
+        "review_engine": review_engine,
+        "review_result": None,
+        "created_at": _now(),
+        "started_at": None,
+        "completed_at": None,
+        "commit_ids": [],
+        "error_log": None,
+        "retry_count": 0,
+        "max_retries": 3,
+        "attempts": [],
+        "timeline": [],
+        "blocked_reason": None,
+        "fallback_reason": None,
+        "review_round": 0,
+        "last_exit_code": None,
+    }
+    add_timeline(review_task, "task_created", {"auto": True, "source": "adversarial_review"})
+    task["review_status"] = "pending"
+    task["status"] = "reviewing"
+    add_timeline(task, "review_requested", {"review_task_id": review_task["id"]})
+    data["tasks"].insert(0, review_task)
+    return review_task
+
+
+def _decompose_from_plan(task: dict) -> list[SubTaskInput]:
+    content = (task.get("plan_content") or "").strip()
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    candidates: list[str] = []
+    for line in lines:
+        # strip bullets and ordered prefixes
+        cleaned = re.sub(r"^(?:[-*]|\d+[.)、])\s*", "", line).strip()
+        if len(cleaned) >= 3:
+            candidates.append(cleaned)
+
+    if not candidates:
+        candidates = [task["title"]]
+
+    subtasks: list[SubTaskInput] = []
+    for idx, line in enumerate(candidates[:8], start=1):
+        text = line
+        ttype = classify_task_type(text, text)
+        priority = task.get("priority", "medium")
+        engine = "auto"
+        subtasks.append(
+            SubTaskInput(
+                title=f"{task['title']} - 子任务 {idx}: {text[:80]}",
+                description=text,
+                task_type=ttype if ttype in TASK_TYPES else "feature",
+                engine=engine,
+                priority=priority,
+            )
+        )
+    return subtasks
+
+
+def _all_subtasks_completed(parent: dict, data: dict) -> bool:
+    sub_ids = parent.get("sub_tasks", [])
+    if not sub_ids:
+        return False
+    for sid in sub_ids:
+        sub = find_task(data, sid)
+        if not sub or sub.get("status") != "completed":
+            return False
+    return True
+
+
+def _refresh_parent_rollup(data: dict):
+    for task in data.get("tasks", []):
+        if task.get("status") != "blocked_by_subtasks":
+            continue
+        if not _all_subtasks_completed(task, data):
+            continue
+
+        # parent roll-up completion
+        task["status"] = "completed"
+        task["completed_at"] = _now()
+        task["blocked_reason"] = None
+        add_timeline(task, "subtasks_all_completed", {"count": len(task.get("sub_tasks", []))})
+
+
+def _update_worker_cli_health():
+    claude_ok = shutil.which(CLAUDE_CLI) is not None
+    codex_ok = shutil.which(CODEX_CLI) is not None
+
+    ENGINE_HEALTH["claude"] = claude_ok
+    ENGINE_HEALTH["codex"] = codex_ok
+
+    now = _now()
+    for worker in WORKERS:
+        worker["cli_available"] = claude_ok if worker["engine"] == "claude" else codex_ok
+        worker["health"]["last_heartbeat"] = worker["health"].get("last_heartbeat") or now
+        worker["last_seen_at"] = worker.get("last_seen_at") or now
+
+
+WORKTREE_DIR = _repo_root() / ".worktrees"
+
+
+def _ensure_worktree(worker: dict) -> str:
+    """Create or validate a git worktree for the given worker. Returns worktree path."""
+    wt_path = WORKTREE_DIR / worker["id"]
+    branch_name = f"worker/{worker['id']}"
+    repo = _repo_root()
+
+    if wt_path.exists() and (wt_path / ".git").exists():
+        worker["worktree_path"] = str(wt_path)
+        return str(wt_path)
+
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Clean up stale worktree entry if directory was deleted but git still tracks it
+    try:
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=str(repo), capture_output=True, timeout=10,
+        )
+    except Exception:
+        pass
+
+    # Check if branch already exists
+    branch_check = subprocess.run(
+        ["git", "rev-parse", "--verify", branch_name],
+        cwd=str(repo), capture_output=True, timeout=10,
+    )
+
+    try:
+        if branch_check.returncode == 0:
+            # Branch exists, add worktree with existing branch
+            subprocess.run(
+                ["git", "worktree", "add", str(wt_path), branch_name],
+                cwd=str(repo), capture_output=True, check=True, timeout=30,
+            )
+        else:
+            # Create new branch
+            subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, str(wt_path)],
+                cwd=str(repo), capture_output=True, check=True, timeout=30,
+            )
+        logger.info("Worktree created for %s at %s", worker["id"], wt_path)
+    except subprocess.CalledProcessError as e:
+        logger.warning("Failed to create worktree for %s: %s", worker["id"], e.stderr)
+        # Fallback to repo root
+        worker["worktree_path"] = str(repo)
+        return str(repo)
+
+    worker["worktree_path"] = str(wt_path)
+    return str(wt_path)
+
+
+async def _prepare_worktree_for_task(worker: dict, task_id: str) -> str:
+    """Reset worktree to latest main and create a task branch. Returns cwd."""
+    wt_path = worker.get("worktree_path") or str(_repo_root())
+    if not Path(wt_path).exists() or wt_path == str(_repo_root()):
+        return str(_repo_root())
+
+    repo = _repo_root()
+    task_branch = f"task/{task_id}"
+
+    try:
+        # Fetch latest from origin (if remote exists)
+        proc = await asyncio.create_subprocess_exec(
+            "git", "fetch", "origin", "--quiet",
+            cwd=str(repo),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=30)
+    except Exception:
+        pass
+
+    try:
+        # Reset worktree to main branch HEAD
+        proc = await asyncio.create_subprocess_exec(
+            "git", "reset", "--hard", "HEAD",
+            cwd=wt_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=15)
+
+        # Create task-specific branch
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "-B", task_branch,
+            cwd=wt_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout=15)
+
+        logger.info("Worktree %s ready on branch %s", worker["id"], task_branch)
+    except Exception as exc:
+        logger.warning("Worktree prep failed for %s: %s", worker["id"], exc)
+
+    return wt_path
+
+
+async def _merge_task_branch(task_id: str) -> tuple[bool, str]:
+    """Merge task branch into main. Returns (success, message)."""
+    repo = _repo_root()
+    task_branch = f"task/{task_id}"
+
+    try:
+        # Check if task branch has commits ahead of main
+        proc = await asyncio.create_subprocess_exec(
+            "git", "log", f"main..{task_branch}", "--oneline",
+            cwd=str(repo),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if not stdout or not stdout.strip():
+            return True, "No new commits to merge"
+
+        # Merge with --no-ff
+        proc = await asyncio.create_subprocess_exec(
+            "git", "merge", "--no-ff", "-m", f"Merge {task_branch}", task_branch,
+            cwd=str(repo),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode == 0:
+            logger.info("Merged %s into main", task_branch)
+            return True, f"Merged {task_branch}"
+
+        # Merge conflict - abort
+        abort_proc = await asyncio.create_subprocess_exec(
+            "git", "merge", "--abort",
+            cwd=str(repo),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(abort_proc.wait(), timeout=10)
+        error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "merge conflict"
+        logger.warning("Merge conflict for %s: %s", task_branch, error_msg)
+        return False, error_msg
+
+    except Exception as exc:
+        logger.warning("Merge failed for %s: %s", task_branch, exc)
+        return False, str(exc)
+
+
+def _worker_repo_cwd(worker: dict) -> str:
+    candidate = Path(worker.get("worktree_path") or "")
+    if candidate.exists() and candidate.is_dir():
+        return str(candidate)
+    return str(_repo_root())
+
+
+def _on_worker_log(worker_id: str, task_id: str, line: str):
+    """Buffer and broadcast a worker log line."""
+    entry = {"at": _now(), "line": line}
+    buf = WORKER_LOGS.setdefault(worker_id, [])
+    buf.append(entry)
+    # Keep only last 200 lines
+    if len(buf) > 200:
+        WORKER_LOGS[worker_id] = buf[-200:]
+    # Broadcast via WebSocket (fire-and-forget)
+    asyncio.ensure_future(ws_manager.broadcast({
+        "type": "worker_log",
+        "worker_id": worker_id,
+        "task_id": task_id,
+        "line": line,
+        "at": entry["at"],
+    }))
+
+
+def _release_worker(worker: dict):
+    worker["pid"] = None
+    worker["status"] = "idle"
+    worker["current_task_id"] = None
+    worker["started_at"] = None
+    worker["lease_id"] = None
+    worker["last_seen_at"] = _now()
+    worker["health"]["last_heartbeat"] = _now()
+    RUNTIME_EXECUTIONS.pop(worker["id"], None)
+
+
+async def _run_worker_task(worker: dict, task_id: str):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        _release_worker(worker)
+        return
+
+    # Prepare worktree for isolated execution
+    cwd = await _prepare_worktree_for_task(worker, task_id)
+
+    async def _on_complete(commit_ids: list[str], summary: Optional[str]):
+        # Try to merge task branch back to main
+        merge_ok, merge_msg = await _merge_task_branch(task_id)
+        if not merge_ok:
+            logger.warning("Auto-merge failed for %s: %s", task_id, merge_msg)
+            # Still complete the task, but record merge issue
+            d = read_tasks()
+            t = find_task(d, task_id)
+            if t:
+                add_timeline(t, "merge_conflict", {"message": merge_msg})
+                emit_event(d, "merge_conflict", level="warning", task_id=task_id,
+                           message=f"Auto-merge failed for {task_id}: {merge_msg}")
+                write_tasks(d)
+
+        await _complete_task_internal(
+            task_id,
+            worker_id=worker["id"],
+            lease_id=worker.get("lease_id"),
+            commit_ids=commit_ids,
+            summary=summary,
+        )
+
+    async def _on_fail(error_log: str, exit_code: Optional[int]):
+        await _fail_task_internal(
+            task_id,
+            worker_id=worker["id"],
+            lease_id=worker.get("lease_id"),
+            error_log=error_log,
+            exit_code=exit_code,
+        )
+
+    # Initialize worker log buffer
+    WORKER_LOGS[worker["id"]] = []
+
+    await WORKER_RUNNER.run_task(
+        worker=worker,
+        task=task,
+        cwd=cwd,
+        on_complete=_on_complete,
+        on_fail=_on_fail,
+        on_release=lambda: _release_worker(worker),
+        on_log=lambda line: _on_worker_log(worker["id"], task_id, line),
+    )
+
+
+async def _dispatch_cycle():
+    if DISPATCH_RUNTIME is None:
+        return
+    await DISPATCH_RUNTIME.dispatch_cycle()
+
+
+async def dispatcher_loop():
+    if DISPATCH_RUNTIME is None:
+        return
+    await DISPATCH_RUNTIME.dispatch_loop()
+
+
+async def health_loop():
+    if DISPATCH_RUNTIME is None:
+        return
+    await DISPATCH_RUNTIME.health_loop()
+
+
+async def _complete_task_internal(task_id: str, *, worker_id: str, lease_id: Optional[str], commit_ids: list[str], summary: Optional[str]) -> Optional[dict]:
+    data = read_tasks()
+    task = find_task(data, task_id)
+    worker = _worker_by_id(worker_id)
+    if not task or not worker:
+        return None
+
+    if task.get("assigned_worker") != worker_id:
+        return None
+    if lease_id and worker.get("lease_id") and worker["lease_id"] != lease_id:
+        return None
+
+    existing = set(task.get("commit_ids", []))
+    for cid in commit_ids:
+        existing.add(cid)
+    task["commit_ids"] = list(existing)
+    task["status"] = "completed"
+    task["completed_at"] = _now()
+    task["error_log"] = None
+    task["last_exit_code"] = 0
+    add_timeline(task, "task_completed", {"worker_id": worker_id, "summary": summary or ""})
+    _complete_attempt(task, True, exit_code=0, error_log=None, commit_ids=commit_ids)
+
+    worker["total_tasks_completed"] += 1
+    worker["health"]["consecutive_failures"] = 0
+
+    review_task = maybe_trigger_adversarial_review(task, data)
+    event = emit_event(
+        data,
+        "task_completed",
+        task_id=task_id,
+        worker_id=worker_id,
+        message=f"Task {task_id} completed",
+        meta={"commit_ids": commit_ids},
+    )
+
+    _refresh_parent_rollup(data)
+    write_tasks(data)
+
+    await broadcast_task_event(task, "task_updated")
+    if review_task:
+        await broadcast_task_event(review_task, "task_created")
+    await broadcast_event(event)
+    return task
+
+
+async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optional[str], error_log: str, exit_code: Optional[int]) -> Optional[dict]:
+    data = read_tasks()
+    task = find_task(data, task_id)
+    worker = _worker_by_id(worker_id)
+    if not task or not worker:
+        return None
+
+    if task.get("assigned_worker") != worker_id:
+        return None
+    if lease_id and worker.get("lease_id") and worker["lease_id"] != lease_id:
+        return None
+
+    retry_count = task.get("retry_count", 0) + 1
+    max_retries = task.get("max_retries", 3)
+    task["error_log"] = error_log
+    task["last_exit_code"] = exit_code
+    task["retry_count"] = min(retry_count, max_retries)
+    _complete_attempt(task, False, exit_code=exit_code, error_log=error_log, commit_ids=[])
+
+    worker["health"]["consecutive_failures"] += 1
+
+    # Auto-retry: if under max retries, schedule for re-dispatch instead of marking failed
+    if retry_count < max_retries:
+        retry_after = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        # Add delay before re-dispatch
+        retry_after = (datetime.now(timezone.utc) + timedelta(seconds=AUTO_RETRY_DELAY_SEC)).isoformat().replace("+00:00", "Z")
+        task["status"] = "pending"
+        task["assigned_worker"] = None
+        task["started_at"] = None
+        task["retry_after"] = retry_after
+        add_timeline(task, "auto_retry_scheduled", {
+            "worker_id": worker_id,
+            "exit_code": exit_code,
+            "retry_count": retry_count,
+            "retry_after": retry_after,
+        })
+
+        event = emit_event(
+            data,
+            "auto_retry_scheduled",
+            level="warning",
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"Task {task_id} auto-retry #{retry_count} scheduled (delay {AUTO_RETRY_DELAY_SEC}s)",
+            meta={"exit_code": exit_code, "retry_count": retry_count, "retry_after": retry_after},
+        )
+    else:
+        task["status"] = "failed"
+        add_timeline(task, "task_failed", {"worker_id": worker_id, "exit_code": exit_code, "max_retries_exceeded": True})
+
+        event = emit_event(
+            data,
+            "task_failed",
+            level="error",
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"Task {task_id} failed (max retries exceeded)",
+            meta={"exit_code": exit_code, "retry_count": retry_count},
+        )
+
+    if worker["health"]["consecutive_failures"] >= 3:
+        emit_event(
+            data,
+            "alert_triggered",
+            level="critical",
+            task_id=task_id,
+            worker_id=worker_id,
+            message=f"Worker {worker_id} failed 3 times consecutively",
+            meta={"consecutive_failures": worker["health"]["consecutive_failures"]},
+        )
+
+    write_tasks(data)
+    await broadcast_task_event(task, "task_updated")
+    await broadcast_event(event)
+    return task
+
+
+# --- FastAPI app lifecycle ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global DISPATCH_RUNTIME
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     if not TASKS_FILE.exists():
-        TASKS_FILE.write_text(json.dumps({
-            "tasks": [],
-            "meta": {"last_updated": datetime.now(timezone.utc).isoformat(), "total_completed": 0, "success_rate": 0, "claude_tasks": 0, "codex_tasks": 0}
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        TASKS_FILE.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "tasks": [],
+                    "events": [],
+                    "meta": {
+                        "last_updated": _now(),
+                        "total_completed": 0,
+                        "success_rate": 0,
+                        "claude_tasks": 0,
+                        "codex_tasks": 0,
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    _update_worker_cli_health()
+
+    # Initialize git worktrees for each worker
+    for worker in WORKERS:
+        try:
+            _ensure_worktree(worker)
+        except Exception as exc:
+            logger.warning("Failed to init worktree for %s: %s", worker["id"], exc)
+
+    DISPATCH_RUNTIME = DispatchRuntime(
+        read_tasks=read_tasks,
+        write_tasks=write_tasks,
+        workers=WORKERS,
+        engine_health=ENGINE_HEALTH,
+        runtime_executions=RUNTIME_EXECUTIONS,
+        route_task=route_task,
+        dependencies_satisfied=dependencies_satisfied,
+        ensure_task_shape=_ensure_task_shape,
+        append_attempt=_append_attempt,
+        add_timeline=add_timeline,
+        emit_event=emit_event,
+        broadcast_event=broadcast_event,
+        broadcast_task_event=broadcast_task_event,
+        run_worker_task=_run_worker_task,
+        refresh_parent_rollup=_refresh_parent_rollup,
+        update_worker_cli_health=_update_worker_cli_health,
+        now_iso=_now,
+        safe_iso=_safe_iso,
+        dispatch_interval_sec=DISPATCH_INTERVAL_SEC,
+        health_interval_sec=HEALTH_INTERVAL_SEC,
+        worker_heartbeat_timeout_sec=WORKER_HEARTBEAT_TIMEOUT_SEC,
+        worker_cooldown_sec=WORKER_COOLDOWN_SEC,
+        worker_max_consecutive_failures=WORKER_MAX_CONSECUTIVE_FAILURES,
+        dispatch_enabled_ref=lambda: DISPATCH_ENABLED,
+        dispatch_stats=DISPATCH_STATS,
+    )
+
+    BACKGROUND_TASKS.clear()
+    BACKGROUND_TASKS.append(asyncio.create_task(dispatcher_loop()))
+    BACKGROUND_TASKS.append(asyncio.create_task(health_loop()))
+
     yield
 
+    for task in BACKGROUND_TASKS:
+        task.cancel()
+    BACKGROUND_TASKS.clear()
+    DISPATCH_RUNTIME = None
 
-app = FastAPI(title="Agent Kanban API", version="0.1.0", lifespan=lifespan)
+
+app = FastAPI(title="Agent Kanban API", version="0.3.0", lifespan=lifespan)
+
+ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 
 # --- API routes ---
-
 @app.get("/api/health")
 async def health():
     return {
         "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": _now(),
         "engines": ENGINE_HEALTH,
+        "worker_exec_mode": WORKER_EXEC_MODE,
     }
 
 
 @app.get("/api/tasks")
-async def list_tasks():
+async def list_tasks(
+    status: Optional[str] = None,
+    engine: Optional[str] = None,
+    priority: Optional[str] = None,
+    q: Optional[str] = None,
+):
     data = read_tasks()
-    return data
+    tasks = data.get("tasks", [])
+
+    def _match(task: dict) -> bool:
+        if status and task.get("status") != status:
+            return False
+        if engine and (task.get("routed_engine") or task.get("engine")) != engine:
+            return False
+        if priority and task.get("priority") != priority:
+            return False
+        if q:
+            hay = f"{task.get('id','')} {task.get('title','')} {task.get('description','')}"
+            if q.lower() not in hay.lower():
+                return False
+        return True
+
+    filtered = [t for t in tasks if _match(t)]
+    return {"tasks": filtered, "meta": data.get("meta", {}), "schema_version": data.get("schema_version", 2)}
 
 
 @app.post("/api/tasks")
@@ -220,95 +1210,322 @@ async def create_task(body: TaskCreate):
 
     task_type = body.task_type or classify_task_type(body.title, body.description)
     routed_engine = route_task({"engine": body.engine, "task_type": task_type})
+    status = "plan_review" if body.plan_mode else "pending"
 
     task = {
         "id": task_id,
         "title": body.title,
         "description": body.description or body.title,
-        "status": "pending",
+        "status": status,
         "priority": body.priority,
         "task_type": task_type,
         "engine": body.engine,
         "routed_engine": routed_engine,
         "parent_task_id": None,
         "sub_tasks": [],
-        "depends_on": [],
+        "depends_on": body.depends_on,
         "plan_mode": body.plan_mode,
         "plan_content": None,
+        "plan_questions": [q.model_dump() for q in body.plan_questions],
         "assigned_worker": None,
         "worktree_branch": None,
         "review_status": None,
         "review_engine": None,
         "review_result": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": _now(),
         "started_at": None,
         "completed_at": None,
         "commit_ids": [],
         "error_log": None,
         "retry_count": 0,
         "max_retries": 3,
+        "attempts": [],
+        "timeline": [],
+        "blocked_reason": None,
+        "fallback_reason": None,
+        "review_round": 0,
+        "last_exit_code": None,
     }
-    data["tasks"].insert(0, task)
-
-    # Update meta stats
-    data["meta"]["claude_tasks"] = sum(1 for t in data["tasks"] if t.get("routed_engine") == "claude")
-    data["meta"]["codex_tasks"] = sum(1 for t in data["tasks"] if t.get("routed_engine") == "codex")
+    add_timeline(task, "task_created", {"status": status})
+    data.setdefault("tasks", []).insert(0, task)
+    event = emit_event(
+        data,
+        "task_created",
+        task_id=task_id,
+        message=f"Task {task_id} created",
+        meta={"status": status},
+    )
     write_tasks(data)
 
-    await ws_manager.broadcast({"type": "task_created", "task": task})
+    await broadcast_task_event(task, "task_created")
+    await broadcast_event(event)
     return task
 
 
 @app.get("/api/tasks/{task_id}")
 async def get_task(task_id: str):
     data = read_tasks()
-    for t in data["tasks"]:
-        if t["id"] == task_id:
-            return t
-    raise HTTPException(status_code=404, detail="Task not found")
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
 
 
 @app.patch("/api/tasks/{task_id}")
 async def update_task(task_id: str, body: TaskUpdate):
     data = read_tasks()
-    for t in data["tasks"]:
-        if t["id"] == task_id:
-            updates = body.model_dump(exclude_none=True)
-            if "status" in updates:
-                if updates["status"] == "in_progress" and t["status"] == "pending":
-                    t["started_at"] = datetime.now(timezone.utc).isoformat()
-                elif updates["status"] == "completed":
-                    t["completed_at"] = datetime.now(timezone.utc).isoformat()
-            t.update(updates)
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
 
-            # Recalculate meta
-            completed = sum(1 for x in data["tasks"] if x["status"] == "completed")
-            failed = sum(1 for x in data["tasks"] if x["status"] == "failed")
-            data["meta"]["total_completed"] = completed
-            data["meta"]["success_rate"] = round(completed / max(completed + failed, 1), 2)
-            data["meta"]["claude_tasks"] = sum(1 for x in data["tasks"] if x.get("routed_engine") == "claude")
-            data["meta"]["codex_tasks"] = sum(1 for x in data["tasks"] if x.get("routed_engine") == "codex")
+    updates = body.model_dump(exclude_none=True)
 
-            write_tasks(data)
-            await ws_manager.broadcast({"type": "task_updated", "task": t})
-            return t
-    raise HTTPException(status_code=404, detail="Task not found")
+    if "status" in updates:
+        new_status = updates["status"]
+        if new_status == "in_progress":
+            if not dependencies_satisfied(task, data):
+                raise HTTPException(status_code=409, detail="Dependencies not completed")
+            task["started_at"] = task.get("started_at") or _now()
+        elif new_status == "completed":
+            task["completed_at"] = _now()
+        elif new_status == "failed":
+            task["retry_count"] = min(task.get("retry_count", 0) + 1, task.get("max_retries", 3))
+        elif new_status == "pending" and task.get("status") == "failed":
+            task["assigned_worker"] = None
+            task["error_log"] = None
+
+        task["status"] = new_status
+        add_timeline(task, "status_updated", {"status": new_status})
+
+    if "commit_ids" in updates and isinstance(updates["commit_ids"], list):
+        existing = set(task.get("commit_ids", []))
+        for cid in updates["commit_ids"]:
+            existing.add(cid)
+        task["commit_ids"] = list(existing)
+        updates.pop("commit_ids", None)
+
+    for key, value in updates.items():
+        if key == "status":
+            continue
+        task[key] = value
+
+    if "engine" in updates or "task_type" in updates:
+        task["routed_engine"] = route_task(task)
+
+    review_task = None
+    if task.get("status") == "completed":
+        review_task = maybe_trigger_adversarial_review(task, data)
+
+    _refresh_parent_rollup(data)
+    write_tasks(data)
+
+    await broadcast_task_event(task, "task_updated")
+    if review_task:
+        await broadcast_task_event(review_task, "task_created")
+    return task
 
 
 @app.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: str):
     data = read_tasks()
-    original_len = len(data["tasks"])
-    data["tasks"] = [t for t in data["tasks"] if t["id"] != task_id]
-    if len(data["tasks"]) == original_len:
+    task = find_task(data, task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    for t in data.get("tasks", []):
+        if task_id in (t.get("depends_on") or []):
+            raise HTTPException(status_code=409, detail="Task is referenced by dependencies")
+
+    data["tasks"] = [t for t in data.get("tasks", []) if t.get("id") != task_id]
+    event = emit_event(data, "task_deleted", task_id=task_id, message=f"Task {task_id} deleted")
     write_tasks(data)
+
     await ws_manager.broadcast({"type": "task_deleted", "task_id": task_id})
+    await broadcast_event(event)
     return {"deleted": task_id}
 
 
-# --- Worker endpoints ---
+# --- Dispatcher APIs ---
+@app.post("/api/dispatcher/next")
+async def dispatch_next(body: DispatchRequest):
+    data = read_tasks()
+    candidates = []
+    for task in data.get("tasks", []):
+        status = task.get("status", "pending")
+        if status not in {"pending", "plan_review"}:
+            continue
+        if status == "plan_review" and not body.allow_plan_tasks:
+            continue
+        if not dependencies_satisfied(task, data):
+            continue
 
+        routed = task.get("routed_engine") or route_task(task)
+        task["routed_engine"] = routed
+        if body.engine and routed != body.engine:
+            continue
+        candidates.append(task)
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No pending task")
+
+    candidates.sort(
+        key=lambda x: (
+            PRIORITY_ORDER.get(x.get("priority", "medium"), 1),
+            x.get("created_at", ""),
+        )
+    )
+    task = candidates[0]
+    if body.worker_id:
+        worker = _worker_by_id(body.worker_id)
+        if not worker:
+            raise HTTPException(status_code=404, detail="Worker not found")
+        if worker["status"] != "idle":
+            raise HTTPException(status_code=409, detail="Worker not idle")
+
+        lease_id = f"lease-{uuid.uuid4().hex[:12]}"
+        task["status"] = "in_progress"
+        task["started_at"] = task.get("started_at") or _now()
+        task["assigned_worker"] = worker["id"]
+        _append_attempt(task, worker["id"], lease_id)
+        add_timeline(task, "task_dispatched", {"worker_id": worker["id"], "lease_id": lease_id, "source": "dispatch_next"})
+
+        worker["status"] = "busy"
+        worker["current_task_id"] = task["id"]
+        worker["lease_id"] = lease_id
+        worker["started_at"] = _now()
+        worker["last_seen_at"] = _now()
+
+        if worker["id"] not in RUNTIME_EXECUTIONS:
+            RUNTIME_EXECUTIONS[worker["id"]] = asyncio.create_task(_run_worker_task(worker, task["id"]))
+
+        dispatch_event = emit_event(
+            data,
+            "task_dispatched",
+            task_id=task["id"],
+            worker_id=worker["id"],
+            message=f"Task {task['id']} dispatched",
+            meta={"engine": worker["engine"], "lease_id": lease_id, "source": "dispatch_next"},
+        )
+        claim_event = emit_event(
+            data,
+            "worker_claimed",
+            task_id=task["id"],
+            worker_id=worker["id"],
+            message="Task claimed",
+            meta={"lease_id": lease_id, "source": "dispatch_next"},
+        )
+
+    write_tasks(data)
+    await broadcast_task_event(task, "task_updated")
+    if body.worker_id:
+        await broadcast_event(dispatch_event)
+        await broadcast_event(claim_event)
+    return {"task": task}
+
+
+@app.get("/api/dispatcher/queue")
+async def dispatcher_queue():
+    data = read_tasks()
+    summary: dict[str, int] = {}
+    blocked: list[dict[str, Any]] = []
+    retries: list[dict[str, Any]] = []
+    fallback: list[dict[str, Any]] = []
+    for task in data.get("tasks", []):
+        status = task.get("status", "pending")
+        summary[status] = summary.get(status, 0) + 1
+        if task.get("fallback_reason"):
+            fallback.append({
+                "task_id": task["id"],
+                "fallback_reason": task.get("fallback_reason"),
+                "routed_engine": task.get("routed_engine") or task.get("engine"),
+            })
+        if task.get("status") == "failed" and task.get("retry_count", 0) < task.get("max_retries", 3):
+            retries.append({
+                "task_id": task["id"],
+                "retry_count": task.get("retry_count", 0),
+                "max_retries": task.get("max_retries", 3),
+                "last_exit_code": task.get("last_exit_code"),
+            })
+        if status == "pending" and not dependencies_satisfied(task, data):
+            blocked.append({
+                "task_id": task["id"],
+                "reason": "dependencies_unmet",
+                "depends_on": task.get("depends_on", []),
+            })
+        elif status in {"plan_review", "blocked_by_subtasks"}:
+            blocked.append({
+                "task_id": task["id"],
+                "reason": task.get("blocked_reason") or status,
+                "depends_on": task.get("depends_on", []),
+            })
+
+    return {
+        "summary": summary,
+        "total": len(data.get("tasks", [])),
+        "blocked": blocked,
+        "fallback": fallback[:100],
+        "retries": retries[:100],
+        "engines": ENGINE_HEALTH,
+    }
+
+
+@app.get("/api/dispatcher/status")
+async def dispatcher_status():
+    """Get dispatcher loop status."""
+    return {
+        "enabled": DISPATCH_ENABLED,
+        "last_cycle_at": DISPATCH_STATS.get("last_cycle_at"),
+        "cycle_count": DISPATCH_STATS.get("cycle_count", 0),
+        "interval_sec": DISPATCH_INTERVAL_SEC,
+        "auto_retry_delay_sec": AUTO_RETRY_DELAY_SEC,
+        "worker_cooldown_sec": WORKER_COOLDOWN_SEC,
+    }
+
+
+@app.post("/api/dispatcher/toggle")
+async def dispatcher_toggle():
+    """Toggle dispatcher on/off."""
+    global DISPATCH_ENABLED
+    DISPATCH_ENABLED = not DISPATCH_ENABLED
+    state = "enabled" if DISPATCH_ENABLED else "paused"
+    logger.info("Dispatcher %s", state)
+
+    data = read_tasks()
+    event = emit_event(
+        data,
+        "dispatcher_toggled",
+        level="info",
+        message=f"Dispatcher {state}",
+        meta={"enabled": DISPATCH_ENABLED},
+    )
+    write_tasks(data)
+    await broadcast_event(event)
+
+    return {"enabled": DISPATCH_ENABLED}
+
+
+@app.post("/api/dispatcher/trigger")
+async def dispatcher_trigger():
+    """Manually trigger a single dispatch cycle."""
+    if DISPATCH_RUNTIME is None:
+        raise HTTPException(status_code=503, detail="Dispatcher not initialized")
+
+    await DISPATCH_RUNTIME.dispatch_cycle()
+    DISPATCH_STATS["last_cycle_at"] = _now()
+    DISPATCH_STATS["cycle_count"] = DISPATCH_STATS.get("cycle_count", 0) + 1
+    return {"triggered": True, "cycle_count": DISPATCH_STATS["cycle_count"]}
+
+
+@app.get("/api/workers/{worker_id}/logs")
+async def get_worker_logs(worker_id: str):
+    """Get buffered log lines for a worker."""
+    worker = _worker_by_id(worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    return {"worker_id": worker_id, "logs": WORKER_LOGS.get(worker_id, [])}
+
+
+# --- Worker endpoints ---
 @app.get("/api/workers")
 async def list_workers():
     return {"workers": WORKERS}
@@ -316,14 +1533,30 @@ async def list_workers():
 
 @app.get("/api/workers/{worker_id}")
 async def get_worker(worker_id: str):
-    for w in WORKERS:
-        if w["id"] == worker_id:
-            return w
-    raise HTTPException(status_code=404, detail="Worker not found")
+    worker = _worker_by_id(worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    return worker
+
+
+@app.patch("/api/workers/{worker_id}")
+async def update_worker(worker_id: str, body: WorkerUpdate):
+    worker = _worker_by_id(worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+    if body.status is not None:
+        worker["status"] = body.status
+    if body.current_task_id is not None:
+        worker["current_task_id"] = body.current_task_id
+
+    worker["last_seen_at"] = _now()
+    worker["health"]["last_heartbeat"] = _now()
+    await ws_manager.broadcast({"type": "worker_updated", "worker": worker})
+    return worker
 
 
 # --- Engine health ---
-
 @app.get("/api/engines/health")
 async def engines_health():
     claude_workers = [w for w in WORKERS if w["engine"] == "claude"]
@@ -334,24 +1567,558 @@ async def engines_health():
                 "healthy": ENGINE_HEALTH["claude"],
                 "workers_total": len(claude_workers),
                 "workers_busy": sum(1 for w in claude_workers if w["status"] == "busy"),
+                "workers_idle": sum(1 for w in claude_workers if w["status"] == "idle"),
             },
             "codex": {
                 "healthy": ENGINE_HEALTH["codex"],
                 "workers_total": len(codex_workers),
                 "workers_busy": sum(1 for w in codex_workers if w["status"] == "busy"),
+                "workers_idle": sum(1 for w in codex_workers if w["status"] == "idle"),
             },
         },
     }
 
 
-# --- WebSocket ---
+@app.patch("/api/engines/{engine}/health")
+async def set_engine_health(engine: str, body: EngineHealthUpdate):
+    if engine not in ENGINE_HEALTH:
+        raise HTTPException(status_code=404, detail="Engine not found")
+    ENGINE_HEALTH[engine] = body.healthy
+    return {"engine": engine, "healthy": ENGINE_HEALTH[engine]}
 
+
+# --- Task execution protocol ---
+@app.post("/api/tasks/{task_id}/claim")
+async def claim_task(task_id: str, body: ClaimRequest):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("status") not in {"pending", "in_progress"}:
+        raise HTTPException(status_code=409, detail="Task not claimable")
+    if task.get("status") == "pending" and not dependencies_satisfied(task, data):
+        raise HTTPException(status_code=409, detail="Dependencies not completed")
+
+    worker = _worker_by_id(body.worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    if worker["status"] not in {"idle", "busy"}:
+        raise HTTPException(status_code=409, detail="Worker not claimable")
+
+    lease_id = f"lease-{uuid.uuid4().hex[:12]}"
+    task["status"] = "in_progress"
+    task["assigned_worker"] = worker["id"]
+    task["started_at"] = task.get("started_at") or _now()
+    _append_attempt(task, worker["id"], lease_id)
+
+    worker["status"] = "busy"
+    worker["current_task_id"] = task_id
+    worker["lease_id"] = lease_id
+    worker["started_at"] = _now()
+    worker["last_seen_at"] = _now()
+    worker["health"]["last_heartbeat"] = _now()
+
+    add_timeline(task, "task_claimed", {"worker_id": worker["id"], "lease_id": lease_id})
+    event = emit_event(data, "worker_claimed", task_id=task_id, worker_id=worker["id"], message="Task claimed")
+    write_tasks(data)
+
+    await broadcast_task_event(task, "task_updated")
+    await broadcast_event(event)
+    return {"task": task, "lease_id": lease_id}
+
+
+@app.post("/api/tasks/{task_id}/heartbeat")
+async def heartbeat_task(task_id: str, body: HeartbeatRequest):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    worker = _worker_by_id(body.worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+
+    if task.get("assigned_worker") != worker["id"]:
+        raise HTTPException(status_code=409, detail="Worker not assigned to task")
+
+    if body.lease_id and worker.get("lease_id") and worker["lease_id"] != body.lease_id:
+        raise HTTPException(status_code=409, detail="Lease mismatch")
+
+    worker["last_seen_at"] = _now()
+    worker["health"]["last_heartbeat"] = _now()
+    return {"ok": True, "worker_id": worker["id"], "task_id": task_id}
+
+
+@app.post("/api/tasks/{task_id}/complete")
+async def complete_task(task_id: str, body: CompleteRequest):
+    task = await _complete_task_internal(
+        task_id,
+        worker_id=body.worker_id,
+        lease_id=body.lease_id,
+        commit_ids=body.commit_ids,
+        summary=body.summary,
+    )
+    if not task:
+        raise HTTPException(status_code=409, detail="Complete rejected")
+    return task
+
+
+@app.post("/api/tasks/{task_id}/fail")
+async def fail_task(task_id: str, body: FailRequest):
+    task = await _fail_task_internal(
+        task_id,
+        worker_id=body.worker_id,
+        lease_id=body.lease_id,
+        error_log=body.error_log,
+        exit_code=body.exit_code,
+    )
+    if not task:
+        raise HTTPException(status_code=409, detail="Fail rejected")
+    return task
+
+
+# --- Task actions ---
+@app.post("/api/tasks/{task_id}/dispatch")
+async def dispatch_task(task_id: str):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("status") != "pending":
+        raise HTTPException(status_code=409, detail="Task is not pending")
+    if not dependencies_satisfied(task, data):
+        raise HTTPException(status_code=409, detail="Dependencies not completed")
+
+    engine = task.get("routed_engine") or route_task(task)
+    worker = next((w for w in WORKERS if w["engine"] == engine and w["status"] == "idle"), None)
+    if not worker:
+        fallback = "codex" if engine == "claude" else "claude"
+        worker = next((w for w in WORKERS if w["engine"] == fallback and w["status"] == "idle"), None)
+        if worker:
+            task["fallback_reason"] = f"manual_dispatch_fallback_{fallback}"
+
+    if not worker:
+        raise HTTPException(status_code=409, detail="No idle worker available")
+
+    lease_id = f"lease-{uuid.uuid4().hex[:12]}"
+    task["status"] = "in_progress"
+    task["assigned_worker"] = worker["id"]
+    task["started_at"] = _now()
+    _append_attempt(task, worker["id"], lease_id)
+    add_timeline(task, "task_dispatched", {"worker_id": worker["id"], "lease_id": lease_id, "manual": True})
+
+    worker["status"] = "busy"
+    worker["current_task_id"] = task_id
+    worker["lease_id"] = lease_id
+    worker["started_at"] = _now()
+    worker["last_seen_at"] = _now()
+
+    if worker["id"] not in RUNTIME_EXECUTIONS:
+        RUNTIME_EXECUTIONS[worker["id"]] = asyncio.create_task(_run_worker_task(worker, task["id"]))
+
+    dispatched_event = emit_event(
+        data,
+        "task_dispatched",
+        task_id=task["id"],
+        worker_id=worker["id"],
+        message=f"Task {task['id']} dispatched manually",
+        meta={"engine": worker["engine"], "lease_id": lease_id, "manual": True},
+    )
+    claimed_event = emit_event(
+        data,
+        "worker_claimed",
+        task_id=task["id"],
+        worker_id=worker["id"],
+        message="Task claimed manually",
+        meta={"lease_id": lease_id, "source": "manual_dispatch"},
+    )
+
+    write_tasks(data)
+    await broadcast_task_event(task, "task_updated")
+    await broadcast_event(dispatched_event)
+    await broadcast_event(claimed_event)
+    return task
+
+
+@app.post("/api/tasks/{task_id}/review")
+async def trigger_review(task_id: str):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("status") not in ("completed", "reviewing"):
+        raise HTTPException(status_code=409, detail="Task must be completed before review")
+
+    review_task = maybe_trigger_adversarial_review(task, data)
+    if not review_task:
+        raise HTTPException(status_code=409, detail="Review already exists or not applicable")
+
+    event = emit_event(
+        data,
+        "review_requested",
+        task_id=task_id,
+        message=f"Adversarial review requested for {task_id}",
+        meta={"review_task_id": review_task["id"]},
+    )
+    write_tasks(data)
+
+    await broadcast_task_event(review_task, "task_created")
+    await broadcast_task_event(task, "task_updated")
+    await broadcast_event(event)
+    return review_task
+
+
+@app.post("/api/tasks/{task_id}/review-submit")
+async def submit_review(task_id: str, body: ReviewResult):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task["review_result"] = body.model_dump()
+    task["review_status"] = "completed"
+    task["status"] = "completed"
+    task["completed_at"] = _now()
+    add_timeline(task, "review_completed", {"summary": body.summary or ""})
+
+    parent_id = task.get("parent_task_id")
+    if parent_id:
+        parent = find_task(data, parent_id)
+        if parent:
+            has_critical = any(issue.get("severity") in ("critical", "high") for issue in (body.model_dump().get("issues") or []))
+            if has_critical:
+                parent["review_status"] = "changes_requested"
+                parent["status"] = "failed"
+                parent["error_log"] = f"Review failed: {body.summary or 'critical issues'}"
+                parent["review_round"] = int(parent.get("review_round", 0) or 0) + 1
+                if parent["review_round"] >= MAX_REVIEW_ROUNDS:
+                    parent["status"] = "plan_review"
+                    parent["blocked_reason"] = "max_review_rounds_exceeded"
+                add_timeline(parent, "review_failed", {"round": parent.get("review_round")})
+            else:
+                parent["review_status"] = "approved"
+                if parent.get("status") != "completed":
+                    parent["status"] = "completed"
+                    parent["completed_at"] = _now()
+                add_timeline(parent, "review_approved", {})
+            await broadcast_task_event(parent, "task_updated")
+
+    event = emit_event(data, "review_submitted", task_id=task_id, message="Review submitted")
+    write_tasks(data)
+
+    await broadcast_task_event(task, "task_updated")
+    await broadcast_event(event)
+    return task
+
+
+@app.post("/api/tasks/{task_id}/approve-plan")
+async def approve_plan(task_id: str, body: PlanApproval):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("status") != "plan_review":
+        raise HTTPException(status_code=409, detail="Task is not in plan_review status")
+
+    if not body.approved:
+        task["status"] = "pending"
+        if body.feedback:
+            prev = task.get("plan_content") or ""
+            task["plan_content"] = f"{prev}\n\n--- 驳回反馈 ---\n{body.feedback}".strip()
+        add_timeline(task, "plan_rejected", {"feedback": body.feedback or ""})
+        event = emit_event(data, "plan_rejected", task_id=task_id, message="Plan rejected")
+        write_tasks(data)
+        await broadcast_task_event(task, "task_updated")
+        await broadcast_event(event)
+        return {"task": task, "sub_tasks": []}
+
+    # approved: auto decompose + auto enqueue
+    task["status"] = "blocked_by_subtasks"
+    task["blocked_reason"] = "waiting_subtasks"
+    add_timeline(task, "plan_approved", {})
+
+    if not task.get("plan_content"):
+        task["plan_content"] = f"1. 实现 {task['title']}\n2. 编写测试\n3. 走代码审查"
+
+    sub_inputs = _decompose_from_plan(task)
+    created_subs = []
+    for sub_input in sub_inputs:
+        sub_id = gen_task_id(data)
+        routed = route_task({"engine": sub_input.engine, "task_type": sub_input.task_type})
+        sub = {
+            "id": sub_id,
+            "title": sub_input.title,
+            "description": sub_input.description or sub_input.title,
+            "status": "pending",
+            "priority": sub_input.priority,
+            "task_type": sub_input.task_type,
+            "engine": sub_input.engine,
+            "routed_engine": routed,
+            "parent_task_id": task_id,
+            "sub_tasks": [],
+            "depends_on": [],
+            "plan_mode": False,
+            "plan_content": None,
+            "plan_questions": [],
+            "assigned_worker": None,
+            "worktree_branch": None,
+            "review_status": None,
+            "review_engine": None,
+            "review_result": None,
+            "created_at": _now(),
+            "started_at": None,
+            "completed_at": None,
+            "commit_ids": [],
+            "error_log": None,
+            "retry_count": 0,
+            "max_retries": 3,
+            "attempts": [],
+            "timeline": [],
+            "blocked_reason": None,
+            "fallback_reason": None,
+            "review_round": 0,
+            "last_exit_code": None,
+        }
+        add_timeline(sub, "task_created", {"auto": True, "source": "plan_decompose"})
+        data["tasks"].insert(0, sub)
+        task.setdefault("sub_tasks", []).append(sub_id)
+        created_subs.append(sub)
+
+    event = emit_event(
+        data,
+        "plan_approved",
+        task_id=task_id,
+        message="Plan approved and decomposed",
+        meta={"sub_task_count": len(created_subs)},
+    )
+
+    write_tasks(data)
+
+    await broadcast_task_event(task, "task_updated")
+    for sub in created_subs:
+        await broadcast_task_event(sub, "task_created")
+    await broadcast_event(event)
+    return {"task": task, "sub_tasks": created_subs}
+
+
+@app.post("/api/tasks/{task_id}/decompose")
+async def decompose_task(task_id: str, body: DecomposeRequest):
+    data = read_tasks()
+    parent = find_task(data, task_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    created_subs = []
+    for sub_input in body.sub_tasks:
+        sub_id = gen_task_id(data)
+        routed = route_task({"engine": sub_input.engine, "task_type": sub_input.task_type})
+        sub = {
+            "id": sub_id,
+            "title": sub_input.title,
+            "description": sub_input.description or sub_input.title,
+            "status": "pending",
+            "priority": sub_input.priority,
+            "task_type": sub_input.task_type,
+            "engine": sub_input.engine,
+            "routed_engine": routed,
+            "parent_task_id": task_id,
+            "sub_tasks": [],
+            "depends_on": [],
+            "plan_mode": False,
+            "plan_content": None,
+            "plan_questions": [],
+            "assigned_worker": None,
+            "worktree_branch": None,
+            "review_status": None,
+            "review_engine": None,
+            "review_result": None,
+            "created_at": _now(),
+            "started_at": None,
+            "completed_at": None,
+            "commit_ids": [],
+            "error_log": None,
+            "retry_count": 0,
+            "max_retries": 3,
+            "attempts": [],
+            "timeline": [],
+            "blocked_reason": None,
+            "fallback_reason": None,
+            "review_round": 0,
+            "last_exit_code": None,
+        }
+        add_timeline(sub, "task_created", {"auto": False, "source": "manual_decompose"})
+        data["tasks"].insert(0, sub)
+        parent.setdefault("sub_tasks", []).append(sub_id)
+        created_subs.append(sub)
+
+    parent["status"] = "blocked_by_subtasks"
+    parent["blocked_reason"] = "waiting_subtasks"
+    add_timeline(parent, "task_decomposed", {"count": len(created_subs)})
+
+    event = emit_event(
+        data,
+        "task_decomposed",
+        task_id=task_id,
+        message=f"Task {task_id} decomposed",
+        meta={"sub_task_count": len(created_subs)},
+    )
+    write_tasks(data)
+
+    for sub in created_subs:
+        await broadcast_task_event(sub, "task_created")
+    await broadcast_task_event(parent, "task_updated")
+    await broadcast_event(event)
+    return {"parent": parent, "sub_tasks": created_subs}
+
+
+@app.post("/api/tasks/{task_id}/retry")
+async def retry_task(task_id: str):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("status") != "failed":
+        raise HTTPException(status_code=409, detail="Only failed tasks can be retried")
+    if task.get("retry_count", 0) >= task.get("max_retries", 3):
+        raise HTTPException(status_code=409, detail="Max retries exceeded")
+
+    task["status"] = "pending"
+    task["error_log"] = None
+    task["assigned_worker"] = None
+    task["started_at"] = None
+    task["blocked_reason"] = None
+    add_timeline(task, "task_retried", {"retry_count": task.get("retry_count", 0)})
+
+    event = emit_event(data, "retry_scheduled", task_id=task_id, message="Retry scheduled")
+    write_tasks(data)
+
+    await broadcast_task_event(task, "task_updated")
+    await broadcast_event(event)
+    return task
+
+
+@app.get("/api/tasks/{task_id}/timeline")
+async def task_timeline(task_id: str):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task_id": task_id, "timeline": task.get("timeline", [])}
+
+
+@app.get("/api/tasks/{task_id}/attempts")
+async def task_attempts(task_id: str):
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task_id": task_id, "attempts": task.get("attempts", [])}
+
+
+# --- Stats ---
+@app.get("/api/stats")
+async def get_stats():
+    data = read_tasks()
+    tasks = data.get("tasks", [])
+
+    by_status: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    by_engine: dict[str, int] = {}
+    by_priority: dict[str, int] = {}
+
+    for task in tasks:
+        by_status[task.get("status", "pending")] = by_status.get(task.get("status", "pending"), 0) + 1
+        by_type[task.get("task_type", "feature")] = by_type.get(task.get("task_type", "feature"), 0) + 1
+        eng = task.get("routed_engine") or "auto"
+        by_engine[eng] = by_engine.get(eng, 0) + 1
+        by_priority[task.get("priority", "medium")] = by_priority.get(task.get("priority", "medium"), 0) + 1
+
+    return {
+        "total_tasks": len(tasks),
+        "by_status": by_status,
+        "by_type": by_type,
+        "by_engine": by_engine,
+        "by_priority": by_priority,
+        "engines": {
+            "claude": {
+                "healthy": ENGINE_HEALTH["claude"],
+                "workers_total": len([w for w in WORKERS if w["engine"] == "claude"]),
+                "workers_busy": len([w for w in WORKERS if w["engine"] == "claude" and w["status"] == "busy"]),
+            },
+            "codex": {
+                "healthy": ENGINE_HEALTH["codex"],
+                "workers_total": len([w for w in WORKERS if w["engine"] == "codex"]),
+                "workers_busy": len([w for w in WORKERS if w["engine"] == "codex" and w["status"] == "busy"]),
+            },
+        },
+        "meta": data.get("meta", {}),
+    }
+
+
+@app.get("/api/stats/daily")
+async def get_daily_stats():
+    data = read_tasks()
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    created_today = sum(1 for t in data.get("tasks", []) if t.get("created_at", "").startswith(today))
+    completed_today = sum(1 for t in data.get("tasks", []) if t.get("completed_at") and str(t.get("completed_at", "")).startswith(today))
+
+    return {"date": today, "created": created_today, "completed": completed_today}
+
+
+# --- Events / Notifications ---
+@app.get("/api/events")
+async def list_events(level: Optional[str] = None, task_id: Optional[str] = None):
+    data = read_tasks()
+    events = data.get("events", [])
+    result = []
+    for event in reversed(events):
+        if level and event.get("level") != level:
+            continue
+        if task_id and event.get("task_id") != task_id:
+            continue
+        result.append(event)
+    return {"events": result[:200]}
+
+
+@app.post("/api/events/{event_id}/ack")
+async def ack_event(event_id: str, body: EventAckRequest):
+    data = read_tasks()
+    target = None
+    for event in data.get("events", []):
+        if event.get("id") == event_id:
+            target = event
+            break
+
+    if not target:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    target["acknowledged"] = True
+    target["acknowledged_at"] = _now()
+    target["acknowledged_by"] = body.by or "user"
+    write_tasks(data)
+    await ws_manager.broadcast({"type": "event_updated", "event": target})
+    return target
+
+
+@app.get("/api/notifications")
+async def get_notifications():
+    data = read_tasks()
+    events = [e for e in data.get("events", []) if e.get("level") in {"warning", "error", "critical"}]
+    return {"notifications": list(reversed(events[-50:]))}
+
+
+@app.post("/api/notifications/subscribe")
+async def subscribe_push(subscription: dict):
+    return {"status": "subscribed", "subscription": subscription}
+
+
+# --- WebSocket ---
 @app.websocket("/ws/tasks")
 async def websocket_tasks(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
         while True:
-            # Keep connection alive, receive pings
             msg = await ws.receive_text()
             if msg == "ping":
                 await ws.send_json({"type": "pong"})
@@ -361,4 +2128,6 @@ async def websocket_tasks(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+    host = os.getenv("HOST", "127.0.0.1")
+    uvicorn.run("main:app", host=host, port=8000, reload=True)
