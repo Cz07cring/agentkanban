@@ -17,6 +17,14 @@ __pycache__/
 .vscode/
 .idea/
 
+# Build artifacts & caches
+frontend/.cache/
+frontend/.next_backup_*/
+frontend/playwright-report/
+frontend/test-results/
+.worktrees/
+.agentpi/
+
 # Env
 .env
 .env.local
