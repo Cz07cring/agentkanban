@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Kanban Web Frontend
+After=network.target agent-kanban-dispatcher.service
+
+[Service]
+Type=simple
+User=agentkanban
+WorkingDirectory=/opt/agentkanban/main-repo/frontend
+ExecStart=/usr/bin/node /opt/agentkanban/main-repo/frontend/.next/standalone/server.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=3000
+
+[Install]
+WantedBy=multi-user.target
