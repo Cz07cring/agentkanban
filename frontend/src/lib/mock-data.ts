@@ -1,7 +1,20 @@
 import { Task, Worker } from "./types";
 
+const taskDefaults: Pick<
+  Task,
+  "attempts" | "timeline" | "blocked_reason" | "fallback_reason" | "review_round" | "last_exit_code"
+> = {
+  attempts: [],
+  timeline: [],
+  blocked_reason: null,
+  fallback_reason: null,
+  review_round: 0,
+  last_exit_code: null,
+};
+
 export const mockTasks: Task[] = [
   {
+    ...taskDefaults,
     id: "task-001",
     title: "开发新闻总结功能",
     description:
@@ -16,6 +29,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: true,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: null,
     worktree_branch: null,
     review_status: null,
@@ -30,6 +44,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-002",
     title: "修复文档编辑器中英文间距问题",
     description:
@@ -44,6 +59,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: null,
     worktree_branch: null,
     review_status: null,
@@ -58,6 +74,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-003",
     title: "实现用户认证系统",
     description: "JWT 登录 + 会话管理 + 密码重置功能",
@@ -71,6 +88,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-0",
     worktree_branch: "task/task-003-auth",
     review_status: null,
@@ -85,6 +103,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-004",
     title: "重构 API 路由模块",
     description: "将路由拆分为独立模块，添加中间件支持",
@@ -98,6 +117,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-3",
     worktree_branch: "task/task-004-refactor-api",
     review_status: null,
@@ -112,6 +132,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-005",
     title: "Review 邮件服务安全性",
     description: "审查邮件发送模块的安全漏洞，检查 XSS 和注入风险",
@@ -125,6 +146,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-4",
     worktree_branch: null,
     review_status: "in_progress",
@@ -139,6 +161,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-006",
     title: "优化数据库查询性能",
     description: "分析慢查询日志，添加索引，优化 N+1 问题",
@@ -152,6 +175,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-3",
     worktree_branch: "task/task-006-db-perf",
     review_status: "pending",
@@ -166,6 +190,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-007",
     title: "实现会议安排功能",
     description: "自动从日历获取会议信息，生成准备材料",
@@ -179,6 +204,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: true,
     plan_content: "1. 集成 Google Calendar API\n2. 实现会议提醒\n3. 自动生成议程",
+    plan_questions: [],
     assigned_worker: "worker-1",
     worktree_branch: "task/task-007-meeting",
     review_status: "passed",
@@ -193,6 +219,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-008",
     title: "添加语音输入 Whisper 集成",
     description: "使用 OpenAI Whisper API 实现语音转文字",
@@ -206,6 +233,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-0",
     worktree_branch: "task/task-008-whisper",
     review_status: "passed",
@@ -220,6 +248,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-009",
     title: "文档导出功能开发失败",
     description: "PDF 导出时中文字体渲染异常",
@@ -233,6 +262,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-2",
     worktree_branch: "task/task-009-pdf",
     review_status: null,
@@ -247,6 +277,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-010",
     title: "旧版通知系统移除",
     description: "移除基于轮询的旧通知系统，已被 WebSocket 替代",
@@ -260,6 +291,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: null,
     worktree_branch: null,
     review_status: null,
@@ -274,6 +306,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-011",
     title: "实现邮件收发模块",
     description: "IMAP 接收 + SMTP 发送，支持附件和 HTML 邮件",
@@ -287,6 +320,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-1",
     worktree_branch: "task/task-011-email",
     review_status: "passed",
@@ -301,6 +335,7 @@ export const mockTasks: Task[] = [
     max_retries: 3,
   },
   {
+    ...taskDefaults,
     id: "task-012",
     title: "安全审计全站 XSS 漏洞",
     description: "扫描所有用户输入点，确认 HTML 转义正确",
@@ -314,6 +349,7 @@ export const mockTasks: Task[] = [
     depends_on: [],
     plan_mode: false,
     plan_content: null,
+    plan_questions: [],
     assigned_worker: "worker-4",
     worktree_branch: null,
     review_status: "passed",
@@ -329,8 +365,15 @@ export const mockTasks: Task[] = [
   },
 ];
 
+const workerDefaults = {
+  lease_id: null,
+  last_seen_at: null,
+  cli_available: true,
+};
+
 export const mockWorkers: Worker[] = [
   {
+    ...workerDefaults,
     id: "worker-0",
     engine: "claude",
     port: 5200,
@@ -341,6 +384,9 @@ export const mockWorkers: Worker[] = [
     pid: 12345,
     started_at: "2026-02-20T08:00:00Z",
     total_tasks_completed: 42,
+    lease_id: "lease-abcd1234",
+    last_seen_at: "2026-02-20T10:05:00Z",
+    cli_available: true,
     health: {
       last_heartbeat: "2026-02-20T10:05:00Z",
       consecutive_failures: 0,
@@ -348,6 +394,7 @@ export const mockWorkers: Worker[] = [
     },
   },
   {
+    ...workerDefaults,
     id: "worker-1",
     engine: "claude",
     port: 5201,
@@ -358,6 +405,9 @@ export const mockWorkers: Worker[] = [
     pid: null,
     started_at: null,
     total_tasks_completed: 38,
+    lease_id: null,
+    last_seen_at: "2026-02-20T10:04:00Z",
+    cli_available: true,
     health: {
       last_heartbeat: "2026-02-20T10:04:00Z",
       consecutive_failures: 0,
@@ -375,6 +425,9 @@ export const mockWorkers: Worker[] = [
     pid: null,
     started_at: null,
     total_tasks_completed: 35,
+    lease_id: null,
+    last_seen_at: "2026-02-20T10:03:00Z",
+    cli_available: true,
     health: {
       last_heartbeat: "2026-02-20T10:03:00Z",
       consecutive_failures: 0,
@@ -392,6 +445,9 @@ export const mockWorkers: Worker[] = [
     pid: 12350,
     started_at: "2026-02-20T09:00:00Z",
     total_tasks_completed: 28,
+    lease_id: "lease-efgh5678",
+    last_seen_at: "2026-02-20T10:05:00Z",
+    cli_available: true,
     health: {
       last_heartbeat: "2026-02-20T10:05:00Z",
       consecutive_failures: 0,
@@ -409,6 +465,9 @@ export const mockWorkers: Worker[] = [
     pid: 12355,
     started_at: "2026-02-20T09:30:00Z",
     total_tasks_completed: 25,
+    lease_id: "lease-ijkl9012",
+    last_seen_at: "2026-02-20T10:05:00Z",
+    cli_available: true,
     health: {
       last_heartbeat: "2026-02-20T10:05:00Z",
       consecutive_failures: 0,

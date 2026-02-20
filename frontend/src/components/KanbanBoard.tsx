@@ -7,6 +7,7 @@ const columnStyles: Record<TaskStatus, string> = {
   pending: "border-t-slate-500",
   in_progress: "border-t-blue-500",
   plan_review: "border-t-purple-500",
+  blocked_by_subtasks: "border-t-indigo-500",
   reviewing: "border-t-amber-500",
   completed: "border-t-emerald-500",
   failed: "border-t-red-500",
@@ -26,11 +27,11 @@ export default function KanbanBoard({
   }));
 
   return (
-    <div className="flex gap-4 overflow-x-auto pb-4 min-h-0 flex-1">
+    <div className="flex gap-3 md:gap-4 overflow-x-auto pb-4 min-h-0 flex-1 kanban-scroll">
       {columns.map((col) => (
         <div
           key={col.id}
-          className={`flex-shrink-0 w-72 bg-slate-900/50 rounded-lg border border-slate-800/50 border-t-2 ${columnStyles[col.id]} flex flex-col`}
+          className={`flex-shrink-0 w-64 md:w-72 bg-slate-900/50 rounded-lg border border-slate-800/50 border-t-2 ${columnStyles[col.id]} flex flex-col snap-start`}
         >
           {/* Column header */}
           <div className="p-3 flex items-center justify-between border-b border-slate-800/50">

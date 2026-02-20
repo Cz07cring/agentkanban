@@ -4,6 +4,7 @@ import { Task } from "@/lib/types";
 
 function formatTime(dateStr: string): string {
   const date = new Date(dateStr);
+  if (isNaN(date.getTime())) return "N/A";
   const month = date.getMonth() + 1;
   const day = date.getDate();
   const hours = date.getHours().toString().padStart(2, "0");
@@ -60,7 +61,12 @@ export default function TaskCard({
   const badge = engineBadge[engine] || engineBadge.auto;
 
   return (
-    <div className="bg-slate-800/80 border border-slate-700/50 rounded-lg p-3 hover:border-slate-600/80 transition-all cursor-pointer group">
+    <div
+      className="bg-slate-800/80 border border-slate-700/50 rounded-lg p-3 hover:border-slate-600/80 transition-all cursor-pointer group"
+      data-task-id={task.id}
+      data-task-status={task.status}
+      onClick={() => onExpand?.(task)}
+    >
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs text-slate-500 font-mono">
           #{task.id.replace("task-", "")}
@@ -126,7 +132,10 @@ export default function TaskCard({
 
       {onExpand && (
         <button
-          onClick={() => onExpand(task)}
+          onClick={(e) => {
+            e.stopPropagation();
+            onExpand(task);
+          }}
           className="mt-2 w-full text-xs text-slate-500 hover:text-slate-300 transition-colors py-1 opacity-0 group-hover:opacity-100"
         >
           展开详情

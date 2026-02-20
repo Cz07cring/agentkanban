@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Engine } from "@/lib/types";
+import VoiceInput from "./VoiceInput";
 
 interface TaskCreateFormProps {
   onSubmit: (task: {
@@ -42,6 +43,10 @@ export default function TaskCreateForm({ onSubmit }: TaskCreateFormProps) {
     }
   };
 
+  const handleVoiceTranscript = (transcript: string) => {
+    setText((prev) => (prev ? prev + " " + transcript : transcript));
+  };
+
   return (
     <div className="bg-slate-900/80 border border-slate-800/50 rounded-lg p-4">
       <div className="flex gap-3">
@@ -49,17 +54,19 @@ export default function TaskCreateForm({ onSubmit }: TaskCreateFormProps) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="添加新任务... (Cmd/Ctrl+Enter 提交)"
+          placeholder="添加新任务... (Cmd/Ctrl+Enter 提交，或点击麦克风语音输入)"
           rows={2}
           className="flex-1 bg-slate-800/50 border border-slate-700/50 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-500 resize-none focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
         />
-        <button
-          onClick={handleSubmit}
-          disabled={!text.trim()}
-          className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white text-sm font-medium rounded-lg transition-colors self-end"
-        >
-          添加
-        </button>
+        <div className="flex flex-col gap-2 self-end">
+          <button
+            onClick={handleSubmit}
+            disabled={!text.trim()}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white text-sm font-medium rounded-lg transition-colors"
+          >
+            添加
+          </button>
+        </div>
       </div>
 
       <div className="flex items-center gap-4 mt-3">
@@ -92,6 +99,10 @@ export default function TaskCreateForm({ onSubmit }: TaskCreateFormProps) {
               {eng === "auto" ? "Auto" : eng === "claude" ? "Claude" : "Codex"}
             </button>
           ))}
+        </div>
+
+        <div className="ml-auto">
+          <VoiceInput onTranscript={handleVoiceTranscript} />
         </div>
       </div>
     </div>

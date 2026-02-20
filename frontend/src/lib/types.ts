@@ -2,6 +2,7 @@ export type TaskStatus =
   | "pending"
   | "in_progress"
   | "plan_review"
+  | "blocked_by_subtasks"
   | "reviewing"
   | "completed"
   | "failed"
@@ -18,6 +19,31 @@ export type TaskType =
 
 export type Engine = "auto" | "claude" | "codex";
 
+export interface PlanQuestion {
+  question: string;
+  options: string[];
+  selected?: number | null;
+}
+
+export interface TaskAttempt {
+  attempt: number;
+  worker_id: string;
+  engine: Engine | string;
+  lease_id: string;
+  started_at: string;
+  completed_at: string | null;
+  status: "running" | "completed" | "failed";
+  exit_code: number | null;
+  error_log: string | null;
+  commit_ids: string[];
+}
+
+export interface TaskTimelineEntry {
+  at: string;
+  event: string;
+  detail: Record<string, unknown>;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -32,6 +58,7 @@ export interface Task {
   depends_on: string[];
   plan_mode: boolean;
   plan_content: string | null;
+  plan_questions: PlanQuestion[];
   assigned_worker: string | null;
   worktree_branch: string | null;
   review_status: string | null;
@@ -44,11 +71,17 @@ export interface Task {
   error_log: string | null;
   retry_count: number;
   max_retries: number;
+  attempts: TaskAttempt[];
+  timeline: TaskTimelineEntry[];
+  blocked_reason: string | null;
+  fallback_reason: string | null;
+  review_round: number;
+  last_exit_code: number | null;
 }
 
 export interface ReviewResult {
   issues: ReviewIssue[];
-  summary: string;
+  summary: string | null;
 }
 
 export interface ReviewIssue {
@@ -70,11 +103,28 @@ export interface Worker {
   pid: number | null;
   started_at: string | null;
   total_tasks_completed: number;
+  lease_id: string | null;
+  last_seen_at: string | null;
+  cli_available: boolean;
   health: {
-    last_heartbeat: string;
+    last_heartbeat: string | null;
     consecutive_failures: number;
     avg_task_duration_ms: number;
   };
+}
+
+export interface EventRecord {
+  id: string;
+  type: string;
+  level: "info" | "warning" | "error" | "critical";
+  task_id: string | null;
+  worker_id: string | null;
+  message: string;
+  meta: Record<string, unknown>;
+  created_at: string;
+  acknowledged: boolean;
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
 }
 
 export interface TasksData {
@@ -86,6 +136,7 @@ export interface TasksData {
     claude_tasks: number;
     codex_tasks: number;
   };
+  schema_version?: number;
 }
 
 export const KANBAN_COLUMNS: {
@@ -95,6 +146,8 @@ export const KANBAN_COLUMNS: {
 }[] = [
   { id: "pending", label: "待开发", color: "bg-slate-500" },
   { id: "in_progress", label: "开发中", color: "bg-blue-500" },
+  { id: "plan_review", label: "待审批", color: "bg-purple-500" },
+  { id: "blocked_by_subtasks", label: "子任务中", color: "bg-indigo-500" },
   { id: "reviewing", label: "待 Review", color: "bg-amber-500" },
   { id: "completed", label: "已完成", color: "bg-emerald-500" },
   { id: "failed", label: "失败", color: "bg-red-500" },

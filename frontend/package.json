@@ -6,7 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test:e2e": "playwright test",
+    "test:e2e:api": "playwright test e2e/api-e2e.spec.ts",
+    "test:e2e:ui": "playwright test --ui"
   },
   "dependencies": {
     "next": "^15.3.3",
@@ -14,11 +17,12 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@tailwindcss/postcss": "^4.1.8",
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
-    "typescript": "^5.8.3",
     "tailwindcss": "^4.1.8",
-    "@tailwindcss/postcss": "^4.1.8"
+    "typescript": "^5.8.3"
   }
 }
