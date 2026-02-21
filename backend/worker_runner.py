@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import re
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
@@ -13,6 +14,13 @@ class WorkerRunner:
         self.claude_cli = claude_cli
         self.codex_cli = codex_cli
         self.exec_mode = exec_mode.lower()
+
+    @staticmethod
+    def _clean_env() -> dict[str, str]:
+        """Return env dict with CLAUDECODE removed so nested CLI invocations work."""
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        return env
 
     @staticmethod
     def build_prompt(task: dict) -> str:
@@ -77,6 +85,7 @@ class WorkerRunner:
             self.claude_cli,
             "-p",
             prompt,
+            "--dangerously-skip-permissions",
             "--allowedTools",
             "Read,Glob,Grep",
             "--output-format",
@@ -92,6 +101,9 @@ class WorkerRunner:
         on_fail: Callable[[str], Awaitable[None] | None],
     ) -> None:
         """Run Claude in read-only mode to generate a plan. Calls on_complete(plan_text) on success."""
+        import logging
+        logger = logging.getLogger("agentkanban.worker_runner")
+
         prompt = self.build_plan_prompt(task)
 
         if self.exec_mode == "dry-run":
@@ -108,14 +120,17 @@ class WorkerRunner:
             return
 
         cmd = self._build_plan_cmd(prompt)
+        logger.info("Plan generation starting: cmd=%s, cwd=%s", cmd[0], cwd)
         stdout_lines: list[str] = []
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=cwd,
+                env=self._clean_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            logger.info("Plan generation process started, pid=%s", proc.pid)
             if proc.stdout:
                 async for raw_line in proc.stdout:
                     line = raw_line.decode("utf-8", errors="ignore").rstrip("\n\r")
@@ -129,12 +144,15 @@ class WorkerRunner:
             rc = proc.returncode or 0
 
             plan_text = "\n".join(stdout_lines).strip()
+            logger.info("Plan generation finished: rc=%s, output_len=%d", rc, len(plan_text))
             if rc == 0 and plan_text:
                 await self._maybe_await(on_complete(plan_text))
             else:
                 err = (stderr_data.decode("utf-8", errors="ignore") or plan_text or "plan generation failed")[-2000:]
+                logger.warning("Plan generation failed: rc=%s, err=%s", rc, err[:200])
                 await self._maybe_await(on_fail(err))
         except Exception as exc:  # noqa: BLE001
+            logger.error("Plan generation exception: %s", exc)
             await self._maybe_await(on_fail(f"Plan generation runtime error: {exc}"))
 
     @staticmethod
@@ -174,6 +192,7 @@ class WorkerRunner:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     cwd=cwd,
+                    env=self._clean_env(),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )

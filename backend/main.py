@@ -2363,6 +2363,7 @@ async def create_project_task(project_id: str, body: TaskCreate):
     await broadcast_event(event)
 
     if body.plan_mode:
+        logger.info("Scheduling plan generation for %s in project %s", task_id, project_id)
         asyncio.create_task(_run_plan_generation(task_id, project_id))
         asyncio.ensure_future(_maybe_push(
             "任务等待计划审批",
