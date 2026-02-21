@@ -64,6 +64,11 @@ from models import (
     TaskUpdate,
     WorkerUpdate,
 )
+from notification import (
+    add_subscription,
+    get_vapid_public_key,
+    send_push_notification,
+)
 from worker_runner import WorkerRunner
 
 logging.basicConfig(level=logging.INFO)
@@ -322,6 +327,14 @@ async def broadcast_task_event(task: dict, event_type: str):
 
 async def broadcast_event(event: dict):
     await ws_manager.broadcast({"type": "event_created", "event": event})
+
+
+async def _maybe_push(title: str, body: str, data: Optional[dict] = None) -> None:
+    """Fire-and-forget push notification — never raises."""
+    try:
+        await send_push_notification(title, body, data)
+    except Exception:  # noqa: BLE001
+        logger.debug("Push notification skipped", exc_info=True)
 
 
 def maybe_trigger_adversarial_review(task: dict, data: dict) -> Optional[dict]:
@@ -625,6 +638,64 @@ def _release_worker(worker: dict):
     WORKER_LOGS.pop(worker["id"], None)
 
 
+async def _run_plan_generation(task_id: str) -> None:
+    """Background coroutine: run Claude in read-only mode to generate plan_content."""
+    data = read_tasks()
+    task = find_task(data, task_id)
+    if not task or task.get("status") != "plan_review":
+        return
+
+    cwd = str(_repo_root())
+
+    async def _on_plan_complete(plan_text: str) -> None:
+        d = read_tasks()
+        t = find_task(d, task_id)
+        if not t:
+            return
+        t["plan_content"] = plan_text
+        add_timeline(t, "plan_generated", {"length": len(plan_text), "source": "ai"})
+        event = emit_event(
+            d,
+            "plan_generated",
+            task_id=task_id,
+            message=f"AI plan generated for {task_id}",
+            meta={"char_count": len(plan_text)},
+        )
+        write_tasks(d)
+        await broadcast_task_event(t, "task_updated")
+        await broadcast_event(event)
+        asyncio.ensure_future(_maybe_push(
+            "计划已生成，等待审批",
+            f"任务 {task_id}「{t.get('title', '')}」的 AI 计划已就绪",
+            {"task_id": task_id, "url": f"/tasks/{task_id}"},
+        ))
+
+    async def _on_plan_fail(error: str) -> None:
+        logger.warning("Plan generation failed for %s: %s", task_id, error[:200])
+        d = read_tasks()
+        t = find_task(d, task_id)
+        if not t:
+            return
+        add_timeline(t, "plan_generation_failed", {"error": error[:500]})
+        event = emit_event(
+            d,
+            "plan_generation_failed",
+            level="warning",
+            task_id=task_id,
+            message=f"AI plan generation failed for {task_id}",
+            meta={"error": error[:200]},
+        )
+        write_tasks(d)
+        await broadcast_event(event)
+
+    await WORKER_RUNNER.run_plan_generation(
+        task=task,
+        cwd=cwd,
+        on_complete=_on_plan_complete,
+        on_fail=_on_plan_fail,
+    )
+
+
 async def _run_worker_task(worker: dict, task_id: str):
     data = read_tasks()
     task = find_task(data, task_id)
@@ -788,6 +859,11 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
             message=f"Task {task_id} auto-retry #{retry_count} scheduled (delay {AUTO_RETRY_DELAY_SEC}s)",
             meta={"exit_code": exit_code, "retry_count": retry_count, "retry_after": retry_after},
         )
+        asyncio.ensure_future(_maybe_push(
+            "任务自动重试",
+            f"任务 {task_id} 第 {retry_count} 次自动重试",
+            {"task_id": task_id, "url": f"/tasks/{task_id}"},
+        ))
     else:
         task["status"] = "failed"
         add_timeline(task, "task_failed", {"worker_id": worker_id, "exit_code": exit_code, "max_retries_exceeded": True})
@@ -801,9 +877,14 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
             message=f"Task {task_id} failed (max retries exceeded)",
             meta={"exit_code": exit_code, "retry_count": retry_count},
         )
+        asyncio.ensure_future(_maybe_push(
+            "任务执行失败",
+            f"任务 {task_id} 超出最大重试次数，已标记为失败",
+            {"task_id": task_id, "url": f"/tasks/{task_id}"},
+        ))
 
     if worker["health"]["consecutive_failures"] >= 3:
-        emit_event(
+        alert_event = emit_event(
             data,
             "alert_triggered",
             level="critical",
@@ -812,6 +893,11 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
             message=f"Worker {worker_id} failed 3 times consecutively",
             meta={"consecutive_failures": worker["health"]["consecutive_failures"]},
         )
+        asyncio.ensure_future(_maybe_push(
+            "Worker 连续失败告警",
+            f"Worker {worker_id} 已连续失败 {worker['health']['consecutive_failures']} 次",
+            {"task_id": task_id, "url": "/workers"},
+        ))
 
     write_tasks(data)
     await broadcast_task_event(task, "task_updated")
@@ -882,6 +968,7 @@ async def lifespan(app: FastAPI):
         worker_max_consecutive_failures=WORKER_MAX_CONSECUTIVE_FAILURES,
         dispatch_enabled_ref=lambda: DISPATCH_ENABLED,
         dispatch_stats=DISPATCH_STATS,
+        send_push=_maybe_push,
     )
 
     BACKGROUND_TASKS.clear()
@@ -1001,6 +1088,15 @@ async def create_task(body: TaskCreate):
 
     await broadcast_task_event(task, "task_created")
     await broadcast_event(event)
+
+    if body.plan_mode:
+        asyncio.create_task(_run_plan_generation(task_id))
+        asyncio.ensure_future(_maybe_push(
+            "任务等待计划审批",
+            f"任务 {task_id}「{body.title}」已进入计划审批，AI 正在生成计划…",
+            {"task_id": task_id, "url": f"/tasks/{task_id}"},
+        ))
+
     return task
 
 
@@ -1537,6 +1633,11 @@ async def submit_review(task_id: str, body: ReviewResult):
                     parent["status"] = "plan_review"
                     parent["blocked_reason"] = "max_review_rounds_exceeded"
                 add_timeline(parent, "review_failed", {"round": parent.get("review_round")})
+                asyncio.ensure_future(_maybe_push(
+                    "Review 发现严重问题",
+                    f"任务 {parent_id} 的 Review 发现 critical/high 问题: {body.summary or ''}",
+                    {"task_id": parent_id, "url": f"/tasks/{parent_id}"},
+                ))
             else:
                 parent["review_status"] = "approved"
                 if parent.get("status") != "completed":
@@ -1852,7 +1953,16 @@ async def get_notifications():
 
 @app.post("/api/notifications/subscribe")
 async def subscribe_push(subscription: dict):
-    return {"status": "subscribed", "subscription": subscription}
+    if not subscription.get("endpoint"):
+        raise HTTPException(status_code=400, detail="Missing endpoint")
+    add_subscription(subscription)
+    return {"status": "subscribed"}
+
+
+@app.get("/api/notifications/vapid-public-key")
+async def get_push_public_key():
+    key = get_vapid_public_key()
+    return {"vapid_public_key": key, "push_enabled": key is not None}
 
 
 # --- WebSocket ---

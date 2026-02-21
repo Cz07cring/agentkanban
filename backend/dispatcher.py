@@ -44,6 +44,7 @@ class DispatchRuntime:
         worker_max_consecutive_failures: int = 5,
         dispatch_enabled_ref: Callable[[], bool] | None = None,
         dispatch_stats: dict | None = None,
+        send_push: Callable[..., Any] | None = None,
     ):
         self.read_tasks = read_tasks
         self.write_tasks = write_tasks
@@ -70,6 +71,7 @@ class DispatchRuntime:
         self.worker_max_consecutive_failures = worker_max_consecutive_failures
         self._dispatch_enabled_ref = dispatch_enabled_ref or (lambda: True)
         self._dispatch_stats = dispatch_stats or {}
+        self._send_push = send_push
 
     async def dispatch_cycle(self):
         data = self.read_tasks()
@@ -92,6 +94,12 @@ class DispatchRuntime:
                 )
                 self.write_tasks(data)
                 await self.broadcast_event(event)
+                if self._send_push:
+                    asyncio.ensure_future(self._send_push(
+                        "引擎全部不可用",
+                        "Claude 和 Codex 均不可用，任务无法调度",
+                        {"url": "/dashboard"},
+                    ))
             return
 
         now = datetime.now(timezone.utc)
