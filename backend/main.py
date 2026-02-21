@@ -38,6 +38,9 @@ from config import (
     LOCK_FILE,
     MAX_REVIEW_ROUNDS,
     PRIORITY_ORDER,
+    PROJECTS_DIR,
+    PROJECTS_FILE,
+    PROJECTS_LOCK,
     ROUTING_RULES,
     TASK_TYPES,
     TASKS_FILE,
@@ -46,6 +49,9 @@ from config import (
     WORKER_HEARTBEAT_TIMEOUT_SEC,
     WORKER_MAX_CONSECUTIVE_FAILURES,
     build_workers,
+    project_dir,
+    project_lock_file,
+    project_tasks_file,
 )
 from dispatcher import DispatchRuntime
 from models import (
@@ -58,6 +64,8 @@ from models import (
     FailRequest,
     HeartbeatRequest,
     PlanApproval,
+    ProjectCreate,
+    ProjectUpdate,
     ReviewResult,
     SubTaskInput,
     TaskCreate,
@@ -166,10 +174,17 @@ def _ensure_task_shape(task: dict):
     task.setdefault("last_exit_code", None)
 
 
-def read_tasks() -> dict:
-    lock = FileLock(str(LOCK_FILE))
+def read_tasks(project_id: str | None = None) -> dict:
+    if project_id:
+        tf = project_tasks_file(project_id)
+        lf = project_lock_file(project_id)
+    else:
+        tf = TASKS_FILE
+        lf = LOCK_FILE
+
+    lock = FileLock(str(lf))
     with lock:
-        data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+        data = json.loads(tf.read_text(encoding="utf-8"))
 
     data.setdefault("tasks", [])
     data.setdefault("events", [])
@@ -180,7 +195,14 @@ def read_tasks() -> dict:
     return data
 
 
-def write_tasks(data: dict):
+def write_tasks(data: dict, project_id: str | None = None):
+    if project_id:
+        tf = project_tasks_file(project_id)
+        lf = project_lock_file(project_id)
+    else:
+        tf = TASKS_FILE
+        lf = LOCK_FILE
+
     tasks = data.get("tasks", [])
     completed = sum(1 for x in tasks if x.get("status") == "completed")
     failed = sum(1 for x in tasks if x.get("status") == "failed")
@@ -193,12 +215,110 @@ def write_tasks(data: dict):
     data["meta"]["codex_tasks"] = sum(1 for t in tasks if t.get("routed_engine") == "codex")
     data["schema_version"] = 2
 
-    lock = FileLock(str(LOCK_FILE))
+    lock = FileLock(str(lf))
     with lock:
-        TASKS_FILE.write_text(
+        tf.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+
+# --- Project storage ---
+def read_projects() -> dict:
+    if not PROJECTS_FILE.exists():
+        return {"schema_version": 1, "projects": []}
+    lock = FileLock(str(PROJECTS_LOCK))
+    with lock:
+        return json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
+
+
+def write_projects(data: dict):
+    lock = FileLock(str(PROJECTS_LOCK))
+    with lock:
+        PROJECTS_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def _gen_project_id(data: dict) -> str:
+    max_num = 0
+    for proj in data.get("projects", []):
+        try:
+            num = int(str(proj["id"]).replace("proj-", ""))
+            max_num = max(max_num, num)
+        except (ValueError, KeyError):
+            continue
+    return f"proj-{max_num + 1:03d}"
+
+
+def _find_project(data: dict, project_id: str) -> dict | None:
+    for proj in data.get("projects", []):
+        if proj.get("id") == project_id:
+            return proj
+    return None
+
+
+def _init_project_tasks(project_id: str):
+    """Initialize an empty tasks.json for a project."""
+    pdir = project_dir(project_id)
+    pdir.mkdir(parents=True, exist_ok=True)
+    tf = project_tasks_file(project_id)
+    if not tf.exists():
+        tf.write_text(
+            json.dumps({
+                "schema_version": 2,
+                "tasks": [],
+                "events": [],
+                "meta": {
+                    "last_updated": _now(),
+                    "total_completed": 0,
+                    "success_rate": 0,
+                    "claude_tasks": 0,
+                    "codex_tasks": 0,
+                },
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+
+def _migrate_to_projects():
+    """One-time migration: create default project from existing dev-tasks.json."""
+    if PROJECTS_FILE.exists():
+        return
+
+    logger.info("Migrating to multi-project: creating default project...")
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    default_id = "proj-default"
+    pdir = project_dir(default_id)
+    pdir.mkdir(parents=True, exist_ok=True)
+
+    # Copy existing tasks to default project
+    if TASKS_FILE.exists():
+        src_data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+        project_tasks_file(default_id).write_text(
+            json.dumps(src_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        _init_project_tasks(default_id)
+
+    # Create projects registry
+    projects_data = {
+        "schema_version": 1,
+        "projects": [
+            {
+                "id": default_id,
+                "name": "默认项目",
+                "description": "从原始数据自动迁移",
+                "repo_path": str(_repo_root()),
+                "created_at": _now(),
+            }
+        ],
+    }
+    write_projects(projects_data)
+    logger.info("Migration complete: default project created")
 
 
 def gen_task_id(data: dict) -> str:
@@ -321,8 +441,11 @@ def emit_event(data: dict, event_type: str, *, level: str = "info", task_id: Opt
     return event
 
 
-async def broadcast_task_event(task: dict, event_type: str):
-    await ws_manager.broadcast({"type": event_type, "task": task})
+async def broadcast_task_event(task: dict, event_type: str, project_id: str | None = None):
+    msg = {"type": event_type, "task": task}
+    if project_id:
+        msg["project_id"] = project_id
+    await ws_manager.broadcast(msg)
 
 
 async def broadcast_event(event: dict):
@@ -464,11 +587,16 @@ def _update_worker_cli_health():
 WORKTREE_DIR = _repo_root() / ".worktrees"
 
 
-def _ensure_worktree(worker: dict) -> str:
+def _ensure_worktree(worker: dict, repo_path: str | None = None) -> str:
     """Create or validate a git worktree for the given worker. Returns worktree path."""
-    wt_path = WORKTREE_DIR / worker["id"]
+    if repo_path:
+        repo = Path(repo_path)
+        wt_base = repo / ".agent-worktrees"
+    else:
+        repo = _repo_root()
+        wt_base = WORKTREE_DIR
+    wt_path = wt_base / worker["id"]
     branch_name = f"worker/{worker['id']}"
-    repo = _repo_root()
 
     if wt_path.exists() and (wt_path / ".git").exists():
         worker["worktree_path"] = str(wt_path)
@@ -515,8 +643,18 @@ def _ensure_worktree(worker: dict) -> str:
     return str(wt_path)
 
 
-async def _prepare_worktree_for_task(worker: dict, task_id: str) -> str:
+async def _prepare_worktree_for_task(worker: dict, task_id: str, project_id: str | None = None) -> str:
     """Reset worktree to latest main and create a task branch. Returns cwd."""
+    # If project_id is given, ensure worktree exists for project repo
+    if project_id:
+        pdata = read_projects()
+        proj = _find_project(pdata, project_id)
+        if proj and proj.get("repo_path"):
+            try:
+                _ensure_worktree(worker, proj["repo_path"])
+            except (subprocess.SubprocessError, OSError) as exc:
+                logger.warning("Failed to ensure project worktree for %s: %s", worker["id"], exc)
+
     wt_path = worker.get("worktree_path") or str(_repo_root())
     if not Path(wt_path).exists() or wt_path == str(_repo_root()):
         return str(_repo_root())
@@ -562,9 +700,9 @@ async def _prepare_worktree_for_task(worker: dict, task_id: str) -> str:
     return wt_path
 
 
-async def _merge_task_branch(task_id: str) -> tuple[bool, str]:
+async def _merge_task_branch(task_id: str, repo_path: str | None = None) -> tuple[bool, str]:
     """Merge task branch into main. Returns (success, message)."""
-    repo = _repo_root()
+    repo = Path(repo_path) if repo_path else _repo_root()
     task_branch = f"task/{task_id}"
 
     try:
@@ -638,17 +776,23 @@ def _release_worker(worker: dict):
     WORKER_LOGS.pop(worker["id"], None)
 
 
-async def _run_plan_generation(task_id: str) -> None:
+async def _run_plan_generation(task_id: str, project_id: str | None = None) -> None:
     """Background coroutine: run Claude in read-only mode to generate plan_content."""
-    data = read_tasks()
+    data = read_tasks(project_id)
     task = find_task(data, task_id)
     if not task or task.get("status") != "plan_review":
         return
 
+    # Use project repo_path if available
     cwd = str(_repo_root())
+    if project_id:
+        pdata = read_projects()
+        proj = _find_project(pdata, project_id)
+        if proj and proj.get("repo_path"):
+            cwd = proj["repo_path"]
 
     async def _on_plan_complete(plan_text: str) -> None:
-        d = read_tasks()
+        d = read_tasks(project_id)
         t = find_task(d, task_id)
         if not t:
             return
@@ -661,8 +805,8 @@ async def _run_plan_generation(task_id: str) -> None:
             message=f"AI plan generated for {task_id}",
             meta={"char_count": len(plan_text)},
         )
-        write_tasks(d)
-        await broadcast_task_event(t, "task_updated")
+        write_tasks(d, project_id)
+        await broadcast_task_event(t, "task_updated", project_id)
         await broadcast_event(event)
         asyncio.ensure_future(_maybe_push(
             "计划已生成，等待审批",
@@ -672,7 +816,7 @@ async def _run_plan_generation(task_id: str) -> None:
 
     async def _on_plan_fail(error: str) -> None:
         logger.warning("Plan generation failed for %s: %s", task_id, error[:200])
-        d = read_tasks()
+        d = read_tasks(project_id)
         t = find_task(d, task_id)
         if not t:
             return
@@ -685,7 +829,7 @@ async def _run_plan_generation(task_id: str) -> None:
             message=f"AI plan generation failed for {task_id}",
             meta={"error": error[:200]},
         )
-        write_tasks(d)
+        write_tasks(d, project_id)
         await broadcast_event(event)
 
     await WORKER_RUNNER.run_plan_generation(
@@ -696,29 +840,37 @@ async def _run_plan_generation(task_id: str) -> None:
     )
 
 
-async def _run_worker_task(worker: dict, task_id: str):
-    data = read_tasks()
+async def _run_worker_task(worker: dict, task_id: str, project_id: str | None = None):
+    data = read_tasks(project_id)
     task = find_task(data, task_id)
     if not task:
         _release_worker(worker)
         return
 
+    # Resolve project repo_path for worktree/merge operations
+    repo_path: str | None = None
+    if project_id:
+        pdata = read_projects()
+        proj = _find_project(pdata, project_id)
+        if proj:
+            repo_path = proj.get("repo_path")
+
     # Prepare worktree for isolated execution
-    cwd = await _prepare_worktree_for_task(worker, task_id)
+    cwd = await _prepare_worktree_for_task(worker, task_id, project_id)
 
     async def _on_complete(commit_ids: list[str], summary: Optional[str]):
         # Try to merge task branch back to main
-        merge_ok, merge_msg = await _merge_task_branch(task_id)
+        merge_ok, merge_msg = await _merge_task_branch(task_id, repo_path)
         if not merge_ok:
             logger.warning("Auto-merge failed for %s: %s", task_id, merge_msg)
             # Still complete the task, but record merge issue
-            d = read_tasks()
+            d = read_tasks(project_id)
             t = find_task(d, task_id)
             if t:
                 add_timeline(t, "merge_conflict", {"message": merge_msg})
                 emit_event(d, "merge_conflict", level="warning", task_id=task_id,
                            message=f"Auto-merge failed for {task_id}: {merge_msg}")
-                write_tasks(d)
+                write_tasks(d, project_id)
 
         await _complete_task_internal(
             task_id,
@@ -726,6 +878,7 @@ async def _run_worker_task(worker: dict, task_id: str):
             lease_id=worker.get("lease_id"),
             commit_ids=commit_ids,
             summary=summary,
+            project_id=project_id,
         )
 
     async def _on_fail(error_log: str, exit_code: Optional[int]):
@@ -735,6 +888,7 @@ async def _run_worker_task(worker: dict, task_id: str):
             lease_id=worker.get("lease_id"),
             error_log=error_log,
             exit_code=exit_code,
+            project_id=project_id,
         )
 
     # Initialize worker log buffer
@@ -769,8 +923,8 @@ async def health_loop():
     await DISPATCH_RUNTIME.health_loop()
 
 
-async def _complete_task_internal(task_id: str, *, worker_id: str, lease_id: Optional[str], commit_ids: list[str], summary: Optional[str]) -> Optional[dict]:
-    data = read_tasks()
+async def _complete_task_internal(task_id: str, *, worker_id: str, lease_id: Optional[str], commit_ids: list[str], summary: Optional[str], project_id: str | None = None) -> Optional[dict]:
+    data = read_tasks(project_id)
     task = find_task(data, task_id)
     worker = _worker_by_id(worker_id)
     if not task or not worker:
@@ -806,17 +960,17 @@ async def _complete_task_internal(task_id: str, *, worker_id: str, lease_id: Opt
     )
 
     _refresh_parent_rollup(data)
-    write_tasks(data)
+    write_tasks(data, project_id)
 
-    await broadcast_task_event(task, "task_updated")
+    await broadcast_task_event(task, "task_updated", project_id)
     if review_task:
-        await broadcast_task_event(review_task, "task_created")
+        await broadcast_task_event(review_task, "task_created", project_id)
     await broadcast_event(event)
     return task
 
 
-async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optional[str], error_log: str, exit_code: Optional[int]) -> Optional[dict]:
-    data = read_tasks()
+async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optional[str], error_log: str, exit_code: Optional[int], project_id: str | None = None) -> Optional[dict]:
+    data = read_tasks(project_id)
     task = find_task(data, task_id)
     worker = _worker_by_id(worker_id)
     if not task or not worker:
@@ -899,8 +1053,8 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
             {"task_id": task_id, "url": "/workers"},
         ))
 
-    write_tasks(data)
-    await broadcast_task_event(task, "task_updated")
+    write_tasks(data, project_id)
+    await broadcast_task_event(task, "task_updated", project_id)
     await broadcast_event(event)
     return task
 
@@ -911,6 +1065,10 @@ async def lifespan(app: FastAPI):
     global DISPATCH_RUNTIME
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Auto-migrate to multi-project on first run
+    _migrate_to_projects()
 
     if not TASKS_FILE.exists():
         TASKS_FILE.write_text(
@@ -935,16 +1093,32 @@ async def lifespan(app: FastAPI):
 
     _update_worker_cli_health()
 
-    # Initialize git worktrees for each worker
+    # Initialize git worktrees for each worker (default repo)
     for worker in WORKERS:
         try:
             _ensure_worktree(worker)
         except (subprocess.SubprocessError, OSError) as exc:
             logger.warning("Failed to init worktree for %s: %s", worker["id"], exc)
 
+    # Initialize worktrees for registered project repositories
+    try:
+        pdata = read_projects()
+        for proj in pdata.get("projects", []):
+            rp = proj.get("repo_path")
+            if rp and Path(rp).is_dir():
+                for worker in WORKERS:
+                    try:
+                        _ensure_worktree(worker, rp)
+                    except (subprocess.SubprocessError, OSError) as exc:
+                        logger.warning("Failed to init worktree for %s in project %s: %s",
+                                       worker["id"], proj["id"], exc)
+    except Exception as exc:
+        logger.warning("Failed to init project worktrees: %s", exc)
+
     DISPATCH_RUNTIME = DispatchRuntime(
         read_tasks=read_tasks,
         write_tasks=write_tasks,
+        read_projects=read_projects,
         workers=WORKERS,
         engine_health=ENGINE_HEALTH,
         runtime_executions=RUNTIME_EXECUTIONS,
@@ -1655,8 +1829,8 @@ async def submit_review(task_id: str, body: ReviewResult):
 
 
 @app.post("/api/tasks/{task_id}/approve-plan")
-async def approve_plan(task_id: str, body: PlanApproval):
-    data = read_tasks()
+async def _approve_plan_impl(task_id: str, body: PlanApproval, project_id: str | None = None):
+    data = read_tasks(project_id)
     task = find_task(data, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1670,8 +1844,8 @@ async def approve_plan(task_id: str, body: PlanApproval):
             task["plan_content"] = f"{prev}\n\n--- 驳回反馈 ---\n{body.feedback}".strip()
         add_timeline(task, "plan_rejected", {"feedback": body.feedback or ""})
         event = emit_event(data, "plan_rejected", task_id=task_id, message="Plan rejected")
-        write_tasks(data)
-        await broadcast_task_event(task, "task_updated")
+        write_tasks(data, project_id)
+        await broadcast_task_event(task, "task_updated", project_id)
         await broadcast_event(event)
         return {"task": task, "sub_tasks": []}
 
@@ -1735,18 +1909,21 @@ async def approve_plan(task_id: str, body: PlanApproval):
         meta={"sub_task_count": len(created_subs)},
     )
 
-    write_tasks(data)
+    write_tasks(data, project_id)
 
-    await broadcast_task_event(task, "task_updated")
+    await broadcast_task_event(task, "task_updated", project_id)
     for sub in created_subs:
-        await broadcast_task_event(sub, "task_created")
+        await broadcast_task_event(sub, "task_created", project_id)
     await broadcast_event(event)
     return {"task": task, "sub_tasks": created_subs}
 
 
-@app.post("/api/tasks/{task_id}/decompose")
-async def decompose_task(task_id: str, body: DecomposeRequest):
-    data = read_tasks()
+async def approve_plan(task_id: str, body: PlanApproval):
+    return await _approve_plan_impl(task_id, body)
+
+
+async def _decompose_task_impl(task_id: str, body: DecomposeRequest, project_id: str | None = None):
+    data = read_tasks(project_id)
     parent = find_task(data, task_id)
     if not parent:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1805,18 +1982,22 @@ async def decompose_task(task_id: str, body: DecomposeRequest):
         message=f"Task {task_id} decomposed",
         meta={"sub_task_count": len(created_subs)},
     )
-    write_tasks(data)
+    write_tasks(data, project_id)
 
     for sub in created_subs:
-        await broadcast_task_event(sub, "task_created")
-    await broadcast_task_event(parent, "task_updated")
+        await broadcast_task_event(sub, "task_created", project_id)
+    await broadcast_task_event(parent, "task_updated", project_id)
     await broadcast_event(event)
     return {"parent": parent, "sub_tasks": created_subs}
 
 
-@app.post("/api/tasks/{task_id}/retry")
-async def retry_task(task_id: str):
-    data = read_tasks()
+@app.post("/api/tasks/{task_id}/decompose")
+async def decompose_task(task_id: str, body: DecomposeRequest):
+    return await _decompose_task_impl(task_id, body)
+
+
+async def _retry_task_impl(task_id: str, project_id: str | None = None):
+    data = read_tasks(project_id)
     task = find_task(data, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1833,11 +2014,16 @@ async def retry_task(task_id: str):
     add_timeline(task, "task_retried", {"retry_count": task.get("retry_count", 0)})
 
     event = emit_event(data, "retry_scheduled", task_id=task_id, message="Retry scheduled")
-    write_tasks(data)
+    write_tasks(data, project_id)
 
-    await broadcast_task_event(task, "task_updated")
+    await broadcast_task_event(task, "task_updated", project_id)
     await broadcast_event(event)
     return task
+
+
+@app.post("/api/tasks/{task_id}/retry")
+async def retry_task(task_id: str):
+    return await _retry_task_impl(task_id)
 
 
 @app.get("/api/tasks/{task_id}/timeline")
@@ -1963,6 +2149,419 @@ async def subscribe_push(subscription: dict):
 async def get_push_public_key():
     key = get_vapid_public_key()
     return {"vapid_public_key": key, "push_enabled": key is not None}
+
+
+# --- Project CRUD ---
+@app.get("/api/projects")
+async def list_projects():
+    data = read_projects()
+    projects = data.get("projects", [])
+    # Enrich with task_count
+    for proj in projects:
+        try:
+            pdata = read_tasks(proj["id"])
+            proj["task_count"] = len(pdata.get("tasks", []))
+        except Exception:
+            proj["task_count"] = 0
+    return {"projects": projects}
+
+
+@app.post("/api/projects")
+async def create_project(body: ProjectCreate):
+    repo = Path(body.repo_path)
+    if not repo.exists():
+        raise HTTPException(status_code=400, detail="repo_path does not exist")
+
+    # Validate it's a git repo
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--git-dir"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            raise HTTPException(status_code=400, detail="repo_path is not a git repository")
+    except (subprocess.SubprocessError, OSError):
+        raise HTTPException(status_code=400, detail="Failed to validate git repository")
+
+    data = read_projects()
+    pid = _gen_project_id(data)
+
+    project = {
+        "id": pid,
+        "name": body.name,
+        "description": body.description,
+        "repo_path": str(repo.resolve()),
+        "created_at": _now(),
+    }
+    data.setdefault("projects", []).append(project)
+    write_projects(data)
+
+    _init_project_tasks(pid)
+
+    project["task_count"] = 0
+    return project
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str):
+    data = read_projects()
+    proj = _find_project(data, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        pdata = read_tasks(project_id)
+        proj["task_count"] = len(pdata.get("tasks", []))
+    except Exception:
+        proj["task_count"] = 0
+    return proj
+
+
+@app.patch("/api/projects/{project_id}")
+async def update_project(project_id: str, body: ProjectUpdate):
+    data = read_projects()
+    proj = _find_project(data, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if body.name is not None:
+        proj["name"] = body.name
+    if body.description is not None:
+        proj["description"] = body.description
+    if body.repo_path is not None:
+        repo = Path(body.repo_path)
+        if not repo.exists():
+            raise HTTPException(status_code=400, detail="repo_path does not exist")
+        proj["repo_path"] = str(repo.resolve())
+
+    write_projects(data)
+    return proj
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    if project_id == "proj-default":
+        raise HTTPException(status_code=400, detail="Cannot delete default project")
+
+    data = read_projects()
+    proj = _find_project(data, project_id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # Check for active tasks
+    try:
+        pdata = read_tasks(project_id)
+        active = [t for t in pdata.get("tasks", []) if t.get("status") in {"in_progress", "reviewing"}]
+        if active:
+            raise HTTPException(status_code=409, detail="Project has active tasks")
+    except Exception:
+        pass
+
+    data["projects"] = [p for p in data.get("projects", []) if p["id"] != project_id]
+    write_projects(data)
+
+    # Remove project directory
+    pdir = project_dir(project_id)
+    if pdir.exists():
+        shutil.rmtree(str(pdir), ignore_errors=True)
+
+    return {"deleted": project_id}
+
+
+# --- Project-scoped task routes ---
+
+@app.get("/api/projects/{project_id}/tasks")
+async def list_project_tasks(
+    project_id: str,
+    status: Optional[str] = None,
+    engine: Optional[str] = None,
+    priority: Optional[str] = None,
+    q: Optional[str] = None,
+):
+    proj_data = read_projects()
+    if not _find_project(proj_data, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    data = read_tasks(project_id)
+    tasks = data.get("tasks", [])
+
+    def _match(task: dict) -> bool:
+        if status and task.get("status") != status:
+            return False
+        if engine and (task.get("routed_engine") or task.get("engine")) != engine:
+            return False
+        if priority and task.get("priority") != priority:
+            return False
+        if q:
+            hay = f"{task.get('id','')} {task.get('title','')} {task.get('description','')}"
+            if q.lower() not in hay.lower():
+                return False
+        return True
+
+    filtered = [t for t in tasks if _match(t)]
+    return {"tasks": filtered, "meta": data.get("meta", {}), "schema_version": data.get("schema_version", 2)}
+
+
+@app.post("/api/projects/{project_id}/tasks")
+async def create_project_task(project_id: str, body: TaskCreate):
+    proj_data = read_projects()
+    if not _find_project(proj_data, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    data = read_tasks(project_id)
+    task_id = gen_task_id(data)
+
+    task_type = body.task_type or classify_task_type(body.title, body.description)
+    routed_engine = route_task({"engine": body.engine, "task_type": task_type})
+    status = "plan_review" if body.plan_mode else "pending"
+
+    task = {
+        "id": task_id,
+        "title": body.title,
+        "description": body.description or body.title,
+        "status": status,
+        "priority": body.priority,
+        "task_type": task_type,
+        "engine": body.engine,
+        "routed_engine": routed_engine,
+        "parent_task_id": None,
+        "sub_tasks": [],
+        "depends_on": body.depends_on,
+        "plan_mode": body.plan_mode,
+        "plan_content": None,
+        "plan_questions": [q.model_dump() for q in body.plan_questions],
+        "assigned_worker": None,
+        "worktree_branch": None,
+        "review_status": None,
+        "review_engine": None,
+        "review_result": None,
+        "created_at": _now(),
+        "started_at": None,
+        "completed_at": None,
+        "commit_ids": [],
+        "error_log": None,
+        "retry_count": 0,
+        "max_retries": 3,
+        "attempts": [],
+        "timeline": [],
+        "blocked_reason": None,
+        "fallback_reason": None,
+        "review_round": 0,
+        "last_exit_code": None,
+    }
+    add_timeline(task, "task_created", {"status": status, "project_id": project_id})
+    data.setdefault("tasks", []).insert(0, task)
+    event = emit_event(
+        data,
+        "task_created",
+        task_id=task_id,
+        message=f"Task {task_id} created in project {project_id}",
+        meta={"status": status, "project_id": project_id},
+    )
+    write_tasks(data, project_id)
+
+    await broadcast_task_event(task, "task_created", project_id=project_id)
+    await broadcast_event(event)
+
+    if body.plan_mode:
+        asyncio.create_task(_run_plan_generation(task_id, project_id))
+        asyncio.ensure_future(_maybe_push(
+            "任务等待计划审批",
+            f"任务 {task_id}「{body.title}」已进入计划审批，AI 正在生成计划…",
+            {"task_id": task_id, "url": f"/tasks/{task_id}"},
+        ))
+
+    return task
+
+
+@app.get("/api/projects/{project_id}/tasks/{task_id}")
+async def get_project_task(project_id: str, task_id: str):
+    data = read_tasks(project_id)
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@app.patch("/api/projects/{project_id}/tasks/{task_id}")
+async def update_project_task(project_id: str, task_id: str, body: TaskUpdate):
+    data = read_tasks(project_id)
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    updates = body.model_dump(exclude_none=True)
+
+    if "status" in updates:
+        new_status = updates["status"]
+        if new_status == "in_progress":
+            if not dependencies_satisfied(task, data):
+                raise HTTPException(status_code=409, detail="Dependencies not completed")
+            task["started_at"] = task.get("started_at") or _now()
+        elif new_status == "completed":
+            task["completed_at"] = _now()
+        elif new_status == "failed":
+            task["retry_count"] = min(task.get("retry_count", 0) + 1, task.get("max_retries", 3))
+        elif new_status == "pending" and task.get("status") == "failed":
+            task["assigned_worker"] = None
+            task["error_log"] = None
+        task["status"] = new_status
+        add_timeline(task, "status_updated", {"status": new_status})
+
+    if "commit_ids" in updates and isinstance(updates["commit_ids"], list):
+        existing = set(task.get("commit_ids", []))
+        for cid in updates["commit_ids"]:
+            existing.add(cid)
+        task["commit_ids"] = list(existing)
+        updates.pop("commit_ids", None)
+
+    for key, value in updates.items():
+        if key == "status":
+            continue
+        task[key] = value
+
+    if "engine" in updates or "task_type" in updates:
+        task["routed_engine"] = route_task(task)
+
+    _refresh_parent_rollup(data)
+    write_tasks(data, project_id)
+
+    await broadcast_task_event(task, "task_updated", project_id=project_id)
+    return task
+
+
+@app.delete("/api/projects/{project_id}/tasks/{task_id}")
+async def delete_project_task(project_id: str, task_id: str):
+    data = read_tasks(project_id)
+    task = find_task(data, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    for t in data.get("tasks", []):
+        if task_id in (t.get("depends_on") or []):
+            raise HTTPException(status_code=409, detail="Task is referenced by dependencies")
+
+    data["tasks"] = [t for t in data.get("tasks", []) if t.get("id") != task_id]
+    emit_event(data, "task_deleted", task_id=task_id, message=f"Task {task_id} deleted")
+    write_tasks(data, project_id)
+
+    await ws_manager.broadcast({"type": "task_deleted", "task_id": task_id, "project_id": project_id})
+    return {"deleted": task_id}
+
+
+@app.post("/api/projects/{project_id}/tasks/{task_id}/approve-plan")
+async def approve_project_plan(project_id: str, task_id: str, body: PlanApproval):
+    proj_data = read_projects()
+    if not _find_project(proj_data, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return await _approve_plan_impl(task_id, body, project_id)
+
+
+@app.post("/api/projects/{project_id}/tasks/{task_id}/decompose")
+async def decompose_project_task(project_id: str, task_id: str, body: DecomposeRequest):
+    proj_data = read_projects()
+    if not _find_project(proj_data, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return await _decompose_task_impl(task_id, body, project_id)
+
+
+@app.post("/api/projects/{project_id}/tasks/{task_id}/retry")
+async def retry_project_task(project_id: str, task_id: str):
+    proj_data = read_projects()
+    if not _find_project(proj_data, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return await _retry_task_impl(task_id, project_id)
+
+
+@app.get("/api/projects/{project_id}/stats")
+async def get_project_stats(project_id: str):
+    data = read_tasks(project_id)
+    tasks = data.get("tasks", [])
+
+    by_status: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    by_engine: dict[str, int] = {}
+    by_priority: dict[str, int] = {}
+
+    for task in tasks:
+        by_status[task.get("status", "pending")] = by_status.get(task.get("status", "pending"), 0) + 1
+        by_type[task.get("task_type", "feature")] = by_type.get(task.get("task_type", "feature"), 0) + 1
+        eng = task.get("routed_engine") or "auto"
+        by_engine[eng] = by_engine.get(eng, 0) + 1
+        by_priority[task.get("priority", "medium")] = by_priority.get(task.get("priority", "medium"), 0) + 1
+
+    return {
+        "total_tasks": len(tasks),
+        "by_status": by_status,
+        "by_type": by_type,
+        "by_engine": by_engine,
+        "by_priority": by_priority,
+        "engines": {
+            "claude": {
+                "healthy": ENGINE_HEALTH["claude"],
+                "workers_total": len([w for w in WORKERS if w["engine"] == "claude"]),
+                "workers_busy": len([w for w in WORKERS if w["engine"] == "claude" and w["status"] == "busy"]),
+            },
+            "codex": {
+                "healthy": ENGINE_HEALTH["codex"],
+                "workers_total": len([w for w in WORKERS if w["engine"] == "codex"]),
+                "workers_busy": len([w for w in WORKERS if w["engine"] == "codex" and w["status"] == "busy"]),
+            },
+        },
+        "meta": data.get("meta", {}),
+    }
+
+
+@app.get("/api/projects/{project_id}/events")
+async def list_project_events(project_id: str, level: Optional[str] = None, task_id: Optional[str] = None):
+    data = read_tasks(project_id)
+    events = data.get("events", [])
+    result = []
+    for event in reversed(events):
+        if level and event.get("level") != level:
+            continue
+        if task_id and event.get("task_id") != task_id:
+            continue
+        result.append(event)
+    return {"events": result[:200]}
+
+
+@app.post("/api/projects/{project_id}/events/{event_id}/ack")
+async def ack_project_event(project_id: str, event_id: str, body: EventAckRequest):
+    data = read_tasks(project_id)
+    target = None
+    for event in data.get("events", []):
+        if event.get("id") == event_id:
+            target = event
+            break
+    if not target:
+        raise HTTPException(status_code=404, detail="Event not found")
+    target["acknowledged"] = True
+    target["acknowledged_at"] = _now()
+    target["acknowledged_by"] = body.by or "user"
+    write_tasks(data, project_id)
+    await ws_manager.broadcast({"type": "event_updated", "event": target, "project_id": project_id})
+    return target
+
+
+@app.get("/api/projects/{project_id}/dispatcher/queue")
+async def project_dispatcher_queue(project_id: str):
+    data = read_tasks(project_id)
+    summary: dict[str, int] = {}
+    blocked: list[dict[str, Any]] = []
+    retries: list[dict[str, Any]] = []
+    fallback: list[dict[str, Any]] = []
+    for task in data.get("tasks", []):
+        st = task.get("status", "pending")
+        summary[st] = summary.get(st, 0) + 1
+        if task.get("fallback_reason"):
+            fallback.append({"task_id": task["id"], "fallback_reason": task.get("fallback_reason"), "routed_engine": task.get("routed_engine") or task.get("engine")})
+        if task.get("status") == "failed" and task.get("retry_count", 0) < task.get("max_retries", 3):
+            retries.append({"task_id": task["id"], "retry_count": task.get("retry_count", 0), "max_retries": task.get("max_retries", 3), "last_exit_code": task.get("last_exit_code")})
+        if st == "pending" and not dependencies_satisfied(task, data):
+            blocked.append({"task_id": task["id"], "reason": "dependencies_unmet", "depends_on": task.get("depends_on", [])})
+        elif st in {"plan_review", "blocked_by_subtasks"}:
+            blocked.append({"task_id": task["id"], "reason": task.get("blocked_reason") or st, "depends_on": task.get("depends_on", [])})
+    return {"summary": summary, "total": len(data.get("tasks", [])), "blocked": blocked, "fallback": fallback[:100], "retries": retries[:100], "engines": ENGINE_HEALTH}
 
 
 # --- WebSocket ---

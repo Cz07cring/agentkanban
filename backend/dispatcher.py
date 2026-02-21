@@ -19,8 +19,9 @@ class DispatchRuntime:
     def __init__(
         self,
         *,
-        read_tasks: Callable[[], dict],
-        write_tasks: Callable[[dict], None],
+        read_tasks: Callable[..., dict],
+        write_tasks: Callable[..., None],
+        read_projects: Callable[[], dict] | None = None,
         workers: list[dict],
         engine_health: dict[str, bool],
         runtime_executions: dict[str, asyncio.Task],
@@ -32,7 +33,7 @@ class DispatchRuntime:
         emit_event: Callable[..., dict],
         broadcast_event: Callable[[dict], Any],
         broadcast_task_event: Callable[[dict, str], Any],
-        run_worker_task: Callable[[dict, str], Any],
+        run_worker_task: Callable[[dict, str, str | None], Any],
         refresh_parent_rollup: Callable[[dict], None],
         update_worker_cli_health: Callable[[], None],
         now_iso: Callable[[], str],
@@ -48,6 +49,7 @@ class DispatchRuntime:
     ):
         self.read_tasks = read_tasks
         self.write_tasks = write_tasks
+        self.read_projects = read_projects
         self.workers = workers
         self.engine_health = engine_health
         self.runtime_executions = runtime_executions
@@ -74,7 +76,22 @@ class DispatchRuntime:
         self._send_push = send_push
 
     async def dispatch_cycle(self):
-        data = self.read_tasks()
+        # Collect project IDs to iterate over
+        project_ids: list[str | None] = [None]  # None = legacy default
+        if self.read_projects:
+            try:
+                pdata = self.read_projects()
+                project_ids = [p["id"] for p in pdata.get("projects", [])]
+                if not project_ids:
+                    project_ids = [None]
+            except Exception:
+                pass
+
+        for pid in project_ids:
+            await self._dispatch_for_project(pid)
+
+    async def _dispatch_for_project(self, project_id: str | None):
+        data = self.read_tasks(project_id) if project_id else self.read_tasks()
         changed = False
 
         self.refresh_parent_rollup(data)
@@ -92,7 +109,10 @@ class DispatchRuntime:
                     message="Both Claude and Codex are unavailable",
                     meta={"engines": self.engine_health.copy()},
                 )
-                self.write_tasks(data)
+                if project_id:
+                    self.write_tasks(data, project_id)
+                else:
+                    self.write_tasks(data)
                 await self.broadcast_event(event)
                 if self._send_push:
                     asyncio.ensure_future(self._send_push(
@@ -155,6 +175,7 @@ class DispatchRuntime:
 
             worker["status"] = "busy"
             worker["current_task_id"] = task["id"]
+            worker["current_project_id"] = project_id
             worker["started_at"] = self.now_iso()
             worker["lease_id"] = lease_id
             worker["last_seen_at"] = self.now_iso()
@@ -166,7 +187,7 @@ class DispatchRuntime:
                 task_id=task["id"],
                 worker_id=worker["id"],
                 message=f"Task {task['id']} dispatched to {worker['id']}",
-                meta={"engine": worker["engine"], "lease_id": lease_id},
+                meta={"engine": worker["engine"], "lease_id": lease_id, "project_id": project_id},
             )
             claim_event = self.emit_event(
                 data,
@@ -174,14 +195,14 @@ class DispatchRuntime:
                 task_id=task["id"],
                 worker_id=worker["id"],
                 message="Task claimed by dispatcher",
-                meta={"lease_id": lease_id, "source": "dispatch_loop"},
+                meta={"lease_id": lease_id, "source": "dispatch_loop", "project_id": project_id},
             )
 
             changed = True
             idle_workers = [w for w in idle_workers if w["id"] != worker["id"]]
 
             if worker["id"] not in self.runtime_executions:
-                self.runtime_executions[worker["id"]] = asyncio.create_task(self.run_worker_task(worker, task["id"]))
+                self.runtime_executions[worker["id"]] = asyncio.create_task(self.run_worker_task(worker, task["id"], project_id))
 
             await self.broadcast_event(dispatch_event)
             await self.broadcast_event(claim_event)
@@ -191,7 +212,10 @@ class DispatchRuntime:
                 break
 
         if changed:
-            self.write_tasks(data)
+            if project_id:
+                self.write_tasks(data, project_id)
+            else:
+                self.write_tasks(data)
 
     async def dispatch_loop(self):
         logger.info("Dispatcher loop started")
