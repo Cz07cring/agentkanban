@@ -148,6 +148,11 @@ class DispatchRuntime:
             engine = task.get("routed_engine") or self.route_task(task)
             worker = next((w for w in idle_workers if w.get("engine") == engine), None)
             if not worker:
+                # Review tasks must NOT fallback to a different engine — it would
+                # defeat adversarial cross-engine review (e.g. Claude reviewing its
+                # own code instead of Codex reviewing it).
+                if task.get("task_type") == "review":
+                    continue
                 fallback = "codex" if engine == "claude" else "claude"
                 worker = next((w for w in idle_workers if w.get("engine") == fallback), None)
                 if worker:

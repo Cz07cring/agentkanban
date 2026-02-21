@@ -30,6 +30,7 @@ from filelock import FileLock
 from config import (
     ALLOWED_ORIGINS,
     AUTO_RETRY_DELAY_SEC,
+    RATE_LIMIT_RETRY_DELAY_SEC,
     CLAUDE_CLI,
     CODEX_CLI,
     DATA_DIR,
@@ -404,10 +405,14 @@ def add_timeline(task: dict, event: str, detail: Optional[dict] = None):
 def _append_attempt(task: dict, worker_id: str, lease_id: str):
     task.setdefault("attempts", [])
     attempt_no = len(task["attempts"]) + 1
+    # Record the actual worker engine (not task routed_engine) so we know
+    # which CLI binary was really used — important when fallback occurs.
+    worker = _worker_by_id(worker_id)
+    actual_engine = worker["engine"] if worker else (task.get("routed_engine") or task.get("engine"))
     task["attempts"].append({
         "attempt": attempt_no,
         "worker_id": worker_id,
-        "engine": task.get("routed_engine") or task.get("engine"),
+        "engine": actual_engine,
         "lease_id": lease_id,
         "started_at": _now(),
         "completed_at": None,
@@ -999,9 +1004,13 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
 
     worker["health"]["consecutive_failures"] += 1
 
+    # Detect rate-limit errors and use a much longer retry delay
+    is_rate_limited = error_log and ("rate_limit" in error_log or "hit your limit" in error_log)
+    retry_delay = RATE_LIMIT_RETRY_DELAY_SEC if is_rate_limited else AUTO_RETRY_DELAY_SEC
+
     # Auto-retry: if under max retries, schedule for re-dispatch instead of marking failed
     if retry_count < max_retries:
-        retry_after = (datetime.now(timezone.utc) + timedelta(seconds=AUTO_RETRY_DELAY_SEC)).isoformat().replace("+00:00", "Z")
+        retry_after = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay)).isoformat().replace("+00:00", "Z")
         task["status"] = "pending"
         task["assigned_worker"] = None
         task["started_at"] = None
@@ -1019,8 +1028,8 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
             level="warning",
             task_id=task_id,
             worker_id=worker_id,
-            message=f"Task {task_id} auto-retry #{retry_count} scheduled (delay {AUTO_RETRY_DELAY_SEC}s)",
-            meta={"exit_code": exit_code, "retry_count": retry_count, "retry_after": retry_after},
+            message=f"Task {task_id} auto-retry #{retry_count} scheduled (delay {retry_delay}s{', rate-limited' if is_rate_limited else ''})",
+            meta={"exit_code": exit_code, "retry_count": retry_count, "retry_after": retry_after, "rate_limited": is_rate_limited},
         )
         asyncio.ensure_future(_maybe_push(
             "任务自动重试",

@@ -42,6 +42,7 @@ WORKER_EXEC_MODE = os.getenv("WORKER_EXEC_MODE", "real").lower()
 
 # --- Retry / Review ---
 AUTO_RETRY_DELAY_SEC = int(os.getenv("AUTO_RETRY_DELAY_SEC", "10"))
+RATE_LIMIT_RETRY_DELAY_SEC = int(os.getenv("RATE_LIMIT_RETRY_DELAY_SEC", "1800"))  # 30 min
 MAX_REVIEW_ROUNDS = int(os.getenv("MAX_REVIEW_ROUNDS", "3"))
 
 # --- CORS ---
