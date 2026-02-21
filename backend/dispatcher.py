@@ -191,7 +191,7 @@ class DispatchRuntime:
             try:
                 if self._dispatch_enabled_ref():
                     await self.dispatch_cycle()
-                    self._dispatch_stats["last_cycle_at"] = datetime.now(timezone.utc).isoformat()
+                    self._dispatch_stats["last_cycle_at"] = self.now_iso()
                     self._dispatch_stats["cycle_count"] = self._dispatch_stats.get("cycle_count", 0) + 1
             except Exception as exc:  # noqa: BLE001
                 logger.exception("dispatch loop error: %s", exc)

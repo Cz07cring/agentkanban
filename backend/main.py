@@ -21,184 +21,56 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from filelock import FileLock
-from pydantic import BaseModel, Field
+
+from config import (
+    ALLOWED_ORIGINS,
+    AUTO_RETRY_DELAY_SEC,
+    CLAUDE_CLI,
+    CODEX_CLI,
+    DATA_DIR,
+    DISPATCH_INTERVAL_SEC,
+    HEALTH_INTERVAL_SEC,
+    LOCK_FILE,
+    MAX_REVIEW_ROUNDS,
+    PRIORITY_ORDER,
+    ROUTING_RULES,
+    TASK_TYPES,
+    TASKS_FILE,
+    WORKER_COOLDOWN_SEC,
+    WORKER_EXEC_MODE,
+    WORKER_HEARTBEAT_TIMEOUT_SEC,
+    WORKER_MAX_CONSECUTIVE_FAILURES,
+    build_workers,
+)
 from dispatcher import DispatchRuntime
+from models import (
+    ClaimRequest,
+    CompleteRequest,
+    DecomposeRequest,
+    DispatchRequest,
+    EngineHealthUpdate,
+    EventAckRequest,
+    FailRequest,
+    HeartbeatRequest,
+    PlanApproval,
+    ReviewResult,
+    SubTaskInput,
+    TaskCreate,
+    TaskUpdate,
+    WorkerUpdate,
+)
 from worker_runner import WorkerRunner
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentkanban")
 
-# --- Config ---
-DATA_DIR = Path(__file__).parent / "data"
-TASKS_FILE = DATA_DIR / "dev-tasks.json"
-LOCK_FILE = DATA_DIR / "dev-task.lock"
-
-DISPATCH_INTERVAL_SEC = int(os.getenv("DISPATCH_INTERVAL_SEC", "5"))
-HEALTH_INTERVAL_SEC = int(os.getenv("HEALTH_INTERVAL_SEC", "30"))
-WORKER_HEARTBEAT_TIMEOUT_SEC = int(os.getenv("WORKER_HEARTBEAT_TIMEOUT_SEC", "120"))
-MAX_REVIEW_ROUNDS = int(os.getenv("MAX_REVIEW_ROUNDS", "3"))
-
-CLAUDE_CLI = os.getenv("CLAUDE_CLI", "claude")
-CODEX_CLI = os.getenv("CODEX_CLI", "codex")
-
-AUTO_RETRY_DELAY_SEC = int(os.getenv("AUTO_RETRY_DELAY_SEC", "10"))
-WORKER_COOLDOWN_SEC = int(os.getenv("WORKER_COOLDOWN_SEC", "60"))
-WORKER_MAX_CONSECUTIVE_FAILURES = int(os.getenv("WORKER_MAX_CONSECUTIVE_FAILURES", "5"))
-
-# real | dry-run
-WORKER_EXEC_MODE = os.getenv("WORKER_EXEC_MODE", "real").lower()
-
-# --- Routing rules ---
-ROUTING_RULES = [
-    {
-        "task_type": "feature",
-        "keywords": ["开发", "实现", "新增", "添加", "创建", "implement", "add", "create"],
-        "preferred_engine": "claude",
-        "fallback_engine": "codex",
-    },
-    {
-        "task_type": "review",
-        "keywords": ["review", "审查", "检查", "code review", "PR review"],
-        "preferred_engine": "codex",
-        "fallback_engine": "claude",
-    },
-    {
-        "task_type": "refactor",
-        "keywords": ["重构", "优化", "refactor", "cleanup", "整理"],
-        "preferred_engine": "codex",
-        "fallback_engine": "claude",
-    },
-    {
-        "task_type": "bugfix",
-        "keywords": ["修复", "bug", "fix", "错误", "异常", "crash"],
-        "preferred_engine": "claude",
-        "fallback_engine": "codex",
-    },
-    {
-        "task_type": "analysis",
-        "keywords": ["分析", "审计", "analyze", "audit", "检测", "扫描"],
-        "preferred_engine": "codex",
-        "fallback_engine": "claude",
-    },
-    {
-        "task_type": "plan",
-        "keywords": ["计划", "拆解", "设计", "plan", "design", "架构"],
-        "preferred_engine": "claude",
-        "fallback_engine": "codex",
-    },
-]
-
-PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
-TASK_TYPES = {"feature", "bugfix", "review", "refactor", "analysis", "plan", "audit"}
-
-# --- In-memory worker state ---
-WORKERS = [
-    {
-        "id": "worker-0",
-        "engine": "claude",
-        "port": 5200,
-        "worktree_path": "/app/worktrees/worker-0",
-        "status": "idle",
-        "capabilities": ["feature", "bugfix", "plan"],
-        "current_task_id": None,
-        "pid": None,
-        "started_at": None,
-        "total_tasks_completed": 0,
-        "lease_id": None,
-        "last_seen_at": None,
-        "cli_available": False,
-        "health": {
-            "last_heartbeat": None,
-            "consecutive_failures": 0,
-            "avg_task_duration_ms": 0,
-        },
-    },
-    {
-        "id": "worker-1",
-        "engine": "claude",
-        "port": 5201,
-        "worktree_path": "/app/worktrees/worker-1",
-        "status": "idle",
-        "capabilities": ["feature", "bugfix", "plan"],
-        "current_task_id": None,
-        "pid": None,
-        "started_at": None,
-        "total_tasks_completed": 0,
-        "lease_id": None,
-        "last_seen_at": None,
-        "cli_available": False,
-        "health": {
-            "last_heartbeat": None,
-            "consecutive_failures": 0,
-            "avg_task_duration_ms": 0,
-        },
-    },
-    {
-        "id": "worker-2",
-        "engine": "claude",
-        "port": 5202,
-        "worktree_path": "/app/worktrees/worker-2",
-        "status": "idle",
-        "capabilities": ["feature", "bugfix", "plan"],
-        "current_task_id": None,
-        "pid": None,
-        "started_at": None,
-        "total_tasks_completed": 0,
-        "lease_id": None,
-        "last_seen_at": None,
-        "cli_available": False,
-        "health": {
-            "last_heartbeat": None,
-            "consecutive_failures": 0,
-            "avg_task_duration_ms": 0,
-        },
-    },
-    {
-        "id": "worker-3",
-        "engine": "codex",
-        "port": 5203,
-        "worktree_path": "/app/worktrees/worker-3",
-        "status": "idle",
-        "capabilities": ["review", "refactor", "analysis", "audit"],
-        "current_task_id": None,
-        "pid": None,
-        "started_at": None,
-        "total_tasks_completed": 0,
-        "lease_id": None,
-        "last_seen_at": None,
-        "cli_available": False,
-        "health": {
-            "last_heartbeat": None,
-            "consecutive_failures": 0,
-            "avg_task_duration_ms": 0,
-        },
-    },
-    {
-        "id": "worker-4",
-        "engine": "codex",
-        "port": 5204,
-        "worktree_path": "/app/worktrees/worker-4",
-        "status": "idle",
-        "capabilities": ["review", "refactor", "analysis", "audit"],
-        "current_task_id": None,
-        "pid": None,
-        "started_at": None,
-        "total_tasks_completed": 0,
-        "lease_id": None,
-        "last_seen_at": None,
-        "cli_available": False,
-        "health": {
-            "last_heartbeat": None,
-            "consecutive_failures": 0,
-            "avg_task_duration_ms": 0,
-        },
-    },
-]
+# --- In-memory worker state (generated from config template) ---
+WORKERS = build_workers()
 
 ENGINE_HEALTH = {"claude": True, "codex": True}
 
@@ -245,126 +117,6 @@ class ConnectionManager:
 
 
 ws_manager = ConnectionManager()
-
-
-# --- Models ---
-class PlanQuestion(BaseModel):
-    question: str
-    options: list[str]
-    selected: Optional[int] = None
-
-
-class ReviewIssue(BaseModel):
-    severity: str
-    file: str
-    line: int
-    description: str
-    suggestion: str
-
-
-class ReviewResult(BaseModel):
-    issues: list[ReviewIssue] = Field(default_factory=list)
-    summary: Optional[str] = None
-
-
-class TaskCreate(BaseModel):
-    title: str = Field(..., min_length=1, max_length=200)
-    description: str = Field(default="", max_length=5000)
-    engine: Literal["auto", "claude", "codex"] = "auto"
-    plan_mode: bool = False
-    priority: Literal["high", "medium", "low"] = "medium"
-    task_type: Optional[Literal["feature", "bugfix", "review", "refactor", "analysis", "plan", "audit"]] = None
-    depends_on: list[str] = Field(default_factory=list)
-    plan_questions: list[PlanQuestion] = Field(default_factory=list)
-
-
-class TaskUpdate(BaseModel):
-    status: Optional[Literal[
-        "pending", "in_progress", "plan_review", "blocked_by_subtasks",
-        "reviewing", "completed", "failed", "cancelled"
-    ]] = None
-    title: Optional[str] = Field(default=None, max_length=200)
-    description: Optional[str] = Field(default=None, max_length=5000)
-    priority: Optional[Literal["high", "medium", "low"]] = None
-    engine: Optional[Literal["auto", "claude", "codex"]] = None
-    routed_engine: Optional[Literal["claude", "codex"]] = None
-    plan_mode: Optional[bool] = None
-    plan_content: Optional[str] = None
-    plan_questions: Optional[list[PlanQuestion]] = None
-    assigned_worker: Optional[str] = None
-    error_log: Optional[str] = None
-    commit_ids: Optional[list[str]] = None
-    review_status: Optional[str] = None
-    review_engine: Optional[str] = None
-    review_result: Optional[ReviewResult] = None
-    depends_on: Optional[list[str]] = None
-    sub_tasks: Optional[list[str]] = None
-    worktree_branch: Optional[str] = None
-    retry_count: Optional[int] = None
-    max_retries: Optional[int] = None
-    blocked_reason: Optional[str] = None
-    fallback_reason: Optional[str] = None
-    review_round: Optional[int] = None
-    last_exit_code: Optional[int] = None
-
-
-class DispatchRequest(BaseModel):
-    worker_id: Optional[str] = None
-    engine: Optional[str] = Field(default=None, pattern="^(claude|codex)$")
-    allow_plan_tasks: bool = False
-
-
-class EngineHealthUpdate(BaseModel):
-    healthy: bool
-
-
-class PlanApproval(BaseModel):
-    approved: bool
-    feedback: Optional[str] = None
-
-
-class SubTaskInput(BaseModel):
-    title: str
-    description: str = ""
-    task_type: str = "feature"
-    engine: str = "auto"
-    priority: str = "medium"
-
-
-class DecomposeRequest(BaseModel):
-    sub_tasks: list[SubTaskInput]
-
-
-class WorkerUpdate(BaseModel):
-    status: Optional[str] = None
-    current_task_id: Optional[str] = None
-
-
-class ClaimRequest(BaseModel):
-    worker_id: str
-
-
-class HeartbeatRequest(BaseModel):
-    worker_id: str
-    lease_id: Optional[str] = None
-
-
-class CompleteRequest(BaseModel):
-    worker_id: str
-    lease_id: Optional[str] = None
-    commit_ids: list[str] = Field(default_factory=list)
-    summary: Optional[str] = None
-
-
-class FailRequest(BaseModel):
-    worker_id: str
-    lease_id: Optional[str] = None
-    error_log: str
-    exit_code: Optional[int] = None
-
-
-class EventAckRequest(BaseModel):
-    by: Optional[str] = None
 
 
 # --- Helpers ---
@@ -717,7 +469,7 @@ def _ensure_worktree(worker: dict) -> str:
             ["git", "worktree", "prune"],
             cwd=str(repo), capture_output=True, timeout=10,
         )
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         pass
 
     # Check if branch already exists
@@ -768,7 +520,7 @@ async def _prepare_worktree_for_task(worker: dict, task_id: str) -> str:
             stderr=asyncio.subprocess.DEVNULL,
         )
         await asyncio.wait_for(proc.wait(), timeout=30)
-    except Exception:
+    except (asyncio.TimeoutError, OSError):
         pass
 
     try:
@@ -791,7 +543,7 @@ async def _prepare_worktree_for_task(worker: dict, task_id: str) -> str:
         await asyncio.wait_for(proc.wait(), timeout=15)
 
         logger.info("Worktree %s ready on branch %s", worker["id"], task_branch)
-    except Exception as exc:
+    except (asyncio.TimeoutError, OSError) as exc:
         logger.warning("Worktree prep failed for %s: %s", worker["id"], exc)
 
     return wt_path
@@ -838,16 +590,9 @@ async def _merge_task_branch(task_id: str) -> tuple[bool, str]:
         logger.warning("Merge conflict for %s: %s", task_branch, error_msg)
         return False, error_msg
 
-    except Exception as exc:
+    except (asyncio.TimeoutError, OSError) as exc:
         logger.warning("Merge failed for %s: %s", task_branch, exc)
         return False, str(exc)
-
-
-def _worker_repo_cwd(worker: dict) -> str:
-    candidate = Path(worker.get("worktree_path") or "")
-    if candidate.exists() and candidate.is_dir():
-        return str(candidate)
-    return str(_repo_root())
 
 
 def _on_worker_log(worker_id: str, task_id: str, line: str):
@@ -877,6 +622,7 @@ def _release_worker(worker: dict):
     worker["last_seen_at"] = _now()
     worker["health"]["last_heartbeat"] = _now()
     RUNTIME_EXECUTIONS.pop(worker["id"], None)
+    WORKER_LOGS.pop(worker["id"], None)
 
 
 async def _run_worker_task(worker: dict, task_id: str):
@@ -1021,8 +767,6 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
 
     # Auto-retry: if under max retries, schedule for re-dispatch instead of marking failed
     if retry_count < max_retries:
-        retry_after = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        # Add delay before re-dispatch
         retry_after = (datetime.now(timezone.utc) + timedelta(seconds=AUTO_RETRY_DELAY_SEC)).isoformat().replace("+00:00", "Z")
         task["status"] = "pending"
         task["assigned_worker"] = None
@@ -1109,7 +853,7 @@ async def lifespan(app: FastAPI):
     for worker in WORKERS:
         try:
             _ensure_worktree(worker)
-        except Exception as exc:
+        except (subprocess.SubprocessError, OSError) as exc:
             logger.warning("Failed to init worktree for %s: %s", worker["id"], exc)
 
     DISPATCH_RUNTIME = DispatchRuntime(
@@ -1153,8 +897,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agent Kanban API", version="0.3.0", lifespan=lifespan)
-
-ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,

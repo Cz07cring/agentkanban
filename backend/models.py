@@ -1,43 +1,84 @@
-"""Agent Kanban - Pydantic Models"""
+"""Agent Kanban - Pydantic request/response models."""
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
 
-# --- Request models ---
+class PlanQuestion(BaseModel):
+    question: str
+    options: list[str]
+    selected: Optional[int] = None
+
+
+class ReviewIssue(BaseModel):
+    severity: str
+    file: str
+    line: int
+    description: str
+    suggestion: str
+
+
+class ReviewResult(BaseModel):
+    issues: list[ReviewIssue] = Field(default_factory=list)
+    summary: Optional[str] = None
+
 
 class TaskCreate(BaseModel):
-    title: str
-    description: str = ""
-    engine: str = "auto"
+    title: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(default="", max_length=5000)
+    engine: Literal["auto", "claude", "codex"] = "auto"
     plan_mode: bool = False
-    priority: str = "medium"
-    task_type: Optional[str] = None
+    priority: Literal["high", "medium", "low"] = "medium"
+    task_type: Optional[Literal["feature", "bugfix", "review", "refactor", "analysis", "plan", "audit"]] = None
+    depends_on: list[str] = Field(default_factory=list)
+    plan_questions: list[PlanQuestion] = Field(default_factory=list)
 
 
 class TaskUpdate(BaseModel):
-    status: Optional[str] = None
-    title: Optional[str] = None
-    description: Optional[str] = None
-    priority: Optional[str] = None
-    engine: Optional[str] = None
+    status: Optional[Literal[
+        "pending", "in_progress", "plan_review", "blocked_by_subtasks",
+        "reviewing", "completed", "failed", "cancelled"
+    ]] = None
+    title: Optional[str] = Field(default=None, max_length=200)
+    description: Optional[str] = Field(default=None, max_length=5000)
+    priority: Optional[Literal["high", "medium", "low"]] = None
+    engine: Optional[Literal["auto", "claude", "codex"]] = None
+    routed_engine: Optional[Literal["claude", "codex"]] = None
     plan_mode: Optional[bool] = None
     plan_content: Optional[str] = None
+    plan_questions: Optional[list[PlanQuestion]] = None
     assigned_worker: Optional[str] = None
     error_log: Optional[str] = None
+    commit_ids: Optional[list[str]] = None
     review_status: Optional[str] = None
-    review_result: Optional[dict] = None
+    review_engine: Optional[str] = None
+    review_result: Optional[ReviewResult] = None
+    depends_on: Optional[list[str]] = None
+    sub_tasks: Optional[list[str]] = None
+    worktree_branch: Optional[str] = None
+    retry_count: Optional[int] = None
+    max_retries: Optional[int] = None
+    blocked_reason: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    review_round: Optional[int] = None
+    last_exit_code: Optional[int] = None
+
+
+class DispatchRequest(BaseModel):
+    worker_id: Optional[str] = None
+    engine: Optional[str] = Field(default=None, pattern="^(claude|codex)$")
+    allow_plan_tasks: bool = False
+
+
+class EngineHealthUpdate(BaseModel):
+    healthy: bool
 
 
 class PlanApproval(BaseModel):
     approved: bool
     feedback: Optional[str] = None
-
-
-class DecomposeRequest(BaseModel):
-    sub_tasks: List[SubTaskInput]
 
 
 class SubTaskInput(BaseModel):
@@ -48,21 +89,37 @@ class SubTaskInput(BaseModel):
     priority: str = "medium"
 
 
+class DecomposeRequest(BaseModel):
+    sub_tasks: list[SubTaskInput]
+
+
 class WorkerUpdate(BaseModel):
     status: Optional[str] = None
     current_task_id: Optional[str] = None
 
 
-class ReviewSubmit(BaseModel):
-    """Submitted by a review worker when review is complete."""
-    verdict: str  # approved, changes_requested, needs_discussion
-    summary: str
-    issues: List[ReviewIssueInput] = []
+class ClaimRequest(BaseModel):
+    worker_id: str
 
 
-class ReviewIssueInput(BaseModel):
-    severity: str  # critical, high, medium, low
-    file: str
-    line: int = 0
-    description: str
-    suggestion: str = ""
+class HeartbeatRequest(BaseModel):
+    worker_id: str
+    lease_id: Optional[str] = None
+
+
+class CompleteRequest(BaseModel):
+    worker_id: str
+    lease_id: Optional[str] = None
+    commit_ids: list[str] = Field(default_factory=list)
+    summary: Optional[str] = None
+
+
+class FailRequest(BaseModel):
+    worker_id: str
+    lease_id: Optional[str] = None
+    error_log: str
+    exit_code: Optional[int] = None
+
+
+class EventAckRequest(BaseModel):
+    by: Optional[str] = None
