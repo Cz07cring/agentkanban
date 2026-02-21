@@ -376,10 +376,19 @@ def find_task(data: dict, task_id: str) -> Optional[dict]:
 
 
 def dependencies_satisfied(task: dict, data: dict) -> bool:
+    # Review tasks can start once the source task reaches "reviewing" status
+    is_review = task.get("task_type") == "review"
     for dep in task.get("depends_on", []) or []:
         dep_task = find_task(data, dep)
-        if not dep_task or dep_task.get("status") != "completed":
+        if not dep_task:
             return False
+        dep_status = dep_task.get("status")
+        if is_review:
+            if dep_status not in ("reviewing", "completed"):
+                return False
+        else:
+            if dep_status != "completed":
+                return False
     return True
 
 
