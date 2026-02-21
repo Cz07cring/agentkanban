@@ -14,23 +14,57 @@ async function screenshot(page: Page, name: string) {
 }
 
 async function cleanTestTasks(page: Page) {
-  for (let pass = 0; pass < 5; pass++) {
-    const res = await page.request.get(`${API}/tasks`);
-    const data = await res.json();
-    const targets = (data.tasks ?? [])
-      .filter((task: any) => task.title.includes(PREFIX))
-      .sort(
-        (a: any, b: any) =>
-          (b.depends_on?.length ?? 0) - (a.depends_on?.length ?? 0),
-      );
+  // Use both global and project-scoped endpoints to ensure full cleanup
+  const endpoints = [
+    `${API}/tasks`,
+    `${API}/projects/proj-default/tasks`,
+  ];
 
-    if (!targets.length) {
+  for (let pass = 0; pass < 5; pass++) {
+    let allTargets: any[] = [];
+
+    for (const endpoint of endpoints) {
+      try {
+        const res = await page.request.get(endpoint);
+        if (res.ok()) {
+          const data = await res.json();
+          const targets = (data.tasks ?? []).filter((task: any) =>
+            task.title.includes(PREFIX),
+          );
+          allTargets.push(...targets);
+        }
+      } catch {
+        // ignore fetch errors
+      }
+    }
+
+    // Deduplicate by task id
+    const seen = new Set<string>();
+    const unique = allTargets.filter((t) => {
+      if (seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    });
+
+    // Sort: tasks with dependencies first
+    unique.sort(
+      (a: any, b: any) =>
+        (b.depends_on?.length ?? 0) - (a.depends_on?.length ?? 0),
+    );
+
+    if (!unique.length) {
       return;
     }
 
     let deleted = 0;
-    for (const task of targets) {
-      const delRes = await page.request.delete(`${API}/tasks/${task.id}`);
+    for (const task of unique) {
+      // Try project-scoped delete first, then global
+      let delRes = await page.request.delete(
+        `${API}/projects/proj-default/tasks/${task.id}`,
+      );
+      if (!delRes.ok()) {
+        delRes = await page.request.delete(`${API}/tasks/${task.id}`);
+      }
       if (delRes.ok()) {
         deleted++;
       }
@@ -79,7 +113,7 @@ async function createTaskUI(
   }
   await page.getByRole("button", { name: "添加" }).click();
   await expect(
-    page.getByRole("heading", { name: input.title }),
+    page.getByRole("heading", { name: input.title }).first(),
   ).toBeVisible({ timeout: 5000 });
 }
 
@@ -88,10 +122,17 @@ async function createTaskAPI(
   create: Record<string, unknown>,
   patch?: Record<string, unknown>,
 ): Promise<string> {
-  const res = await page.request.post(`${API}/tasks`, { data: create });
+  // Use project-scoped endpoint so tasks appear in the UI
+  const res = await page.request.post(
+    `${API}/projects/proj-default/tasks`,
+    { data: create },
+  );
   const task = await res.json();
   if (patch) {
-    await page.request.patch(`${API}/tasks/${task.id}`, { data: patch });
+    await page.request.patch(
+      `${API}/projects/proj-default/tasks/${task.id}`,
+      { data: patch },
+    );
   }
   return task.id;
 }

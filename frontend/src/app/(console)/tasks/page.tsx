@@ -15,12 +15,14 @@ import {
   triggerReview,
   updateTask,
 } from "@/lib/api";
+import { useProjectContext } from "@/lib/project-context";
 import KanbanBoard from "@/components/KanbanBoard";
 import StatsBar from "@/components/StatsBar";
 import TaskCreateForm from "@/components/TaskCreateForm";
 import TaskDetailPanel from "@/components/TaskDetailPanel";
 
 export default function TasksPage() {
+  const { activeProjectId } = useProjectContext();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [loading, setLoading] = useState(true);
@@ -31,7 +33,7 @@ export default function TasksPage() {
   const loadData = useCallback(async () => {
     try {
       const [tasksData, workersData] = await Promise.all([
-        fetchTasks(),
+        fetchTasks(undefined, activeProjectId),
         fetchWorkers(),
       ]);
       setTasks(tasksData.tasks);
@@ -42,9 +44,10 @@ export default function TasksPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [activeProjectId]);
 
   useEffect(() => {
+    setLoading(true);
     loadData();
   }, [loadData]);
 
@@ -80,34 +83,34 @@ export default function TasksPage() {
       plan_mode: boolean;
     }) => {
       try {
-        const newTask = await createTask(input);
+        const newTask = await createTask(input, activeProjectId);
         setTasks((prev) => (prev.some((t) => t.id === newTask.id) ? prev : [newTask, ...prev]));
       } catch (err) {
         setError(err instanceof Error ? err.message : "创建任务失败");
       }
     },
-    []
+    [activeProjectId]
   );
 
   const handleUpdateStatus = useCallback(async (taskId: string, status: TaskStatus) => {
     try {
-      const updated = await updateTask(taskId, { status });
+      const updated = await updateTask(taskId, { status }, activeProjectId);
       setTasks((prev) => prev.map((t) => (t.id === taskId ? updated : t)));
       setSelectedTask((prev) => (prev && prev.id === taskId ? updated : prev));
     } catch (err) {
       setError(err instanceof Error ? err.message : "更新任务失败");
     }
-  }, []);
+  }, [activeProjectId]);
 
   const handleDeleteTask = useCallback(async (taskId: string) => {
     try {
-      await deleteTask(taskId);
+      await deleteTask(taskId, activeProjectId);
       setTasks((prev) => prev.filter((t) => t.id !== taskId));
       setSelectedTask(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除任务失败");
     }
-  }, []);
+  }, [activeProjectId]);
 
   const handleApprovePlan = useCallback(
     async (taskId: string, approved: boolean, feedback?: string) => {
