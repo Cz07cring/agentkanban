@@ -24,7 +24,7 @@ class WorkerRunner:
 
     @staticmethod
     def build_prompt(task: dict) -> str:
-        return (
+        base = (
             "你是 Agent Kanban 自动执行 Worker。\\n"
             f"任务ID: {task['id']}\\n"
             f"任务标题: {task['title']}\\n"
@@ -34,6 +34,14 @@ class WorkerRunner:
             "请在当前仓库工作目录中完成此任务。"
             "完成后输出简要总结，并尽量输出 commit hash。"
         )
+        review_feedback = task.get("_review_feedback")
+        if review_feedback:
+            base += (
+                "\n\n⚠️ 上一轮 Code Review 发现了以下问题，请优先修复：\n"
+                f"{review_feedback}\n"
+                "修复完成后提交代码。"
+            )
+        return base
 
     def _build_cmd(self, engine: str, prompt: str) -> list[str]:
         if engine == "claude":
@@ -60,6 +68,32 @@ class WorkerRunner:
                 seen.add(item)
                 out.append(item)
         return out[:20]
+
+    @staticmethod
+    def build_review_prompt(task: dict) -> str:
+        """Build a structured-output prompt for adversarial code review."""
+        parent_id = task.get("parent_task_id", "unknown")
+        return (
+            "你是 Agent Kanban 的代码审查 Worker，执行对抗式 Code Review。\n"
+            f"任务ID: {task['id']}\n"
+            f"审查目标: 任务 {parent_id} 的代码变更\n"
+            f"任务描述: {task.get('description', '')}\n\n"
+            "请仔细阅读当前仓库中的代码，从以下角度审查：\n"
+            "- 逻辑正确性和边界条件\n"
+            "- 安全漏洞（注入、越权等）\n"
+            "- 错误处理的完整性\n"
+            "- 性能问题\n"
+            "- 代码风格和可维护性\n\n"
+            "完成审查后，你必须在输出末尾附上如下 JSON 块（用 ```json 包裹）：\n"
+            "```json\n"
+            '{"issues": [\n'
+            '  {"severity": "critical|high|medium|low", "file": "路径", "line": 行号, '
+            '"description": "问题描述", "suggestion": "修复建议"}\n'
+            '], "summary": "一句话总结审查结论"}\n'
+            "```\n"
+            "severity 只能是 critical/high/medium/low 之一。\n"
+            "如果没有发现问题，issues 为空数组即可。"
+        )
 
     @staticmethod
     def build_plan_prompt(task: dict) -> str:
@@ -172,7 +206,10 @@ class WorkerRunner:
         on_release: Callable[[], Awaitable[None] | None],
         on_log: Callable[[str], None] | None = None,
     ):
-        prompt = self.build_prompt(task)
+        if task.get("task_type") == "review":
+            prompt = self.build_review_prompt(task)
+        else:
+            prompt = self.build_prompt(task)
         cmd = self._build_cmd(worker["engine"], prompt)
 
         started_at = datetime.now(timezone.utc)

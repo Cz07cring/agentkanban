@@ -474,13 +474,117 @@ async def _maybe_push(title: str, body: str, data: Optional[dict] = None) -> Non
         logger.debug("Push notification skipped", exc_info=True)
 
 
+def _parse_review_json(text: str) -> tuple[list[dict] | None, str]:
+    """Extract structured review JSON from worker stdout.
+
+    Looks for the **last** ```json ... ``` fenced block containing
+    {"issues": [...], "summary": "..."}.
+    Returns (issues_list, summary_string).
+    Returns (None, "") when the output cannot be parsed — callers must
+    treat this as an indeterminate review (not an auto-approval).
+    """
+    pattern = r"```json\s*\n?(.*?)\n?\s*```"
+    matches = re.findall(pattern, text, re.DOTALL)
+    if not matches:
+        logger.warning("Review output missing JSON block; cannot parse review result")
+        return None, ""
+    try:
+        obj = json.loads(matches[-1])  # Take the LAST json block
+        issues = obj.get("issues", [])
+        summary = obj.get("summary", "")
+        return issues, summary
+    except (json.JSONDecodeError, AttributeError) as exc:
+        logger.warning("Review JSON parse failed: %s", exc)
+        return None, ""
+
+
+def _handle_review_completion(
+    review_task: dict, summary: str, data: dict, project_id: str | None,
+) -> None:
+    """Parse review output and drive the Review→Fix→Verify loop."""
+    issues, review_summary = _parse_review_json(summary)
+
+    # Unparseable review output — escalate to human, never auto-approve
+    if issues is None:
+        review_task["review_result"] = {
+            "issues": [], "summary": "parse_failed", "raw": summary[:2000],
+        }
+        review_task["review_status"] = "completed"
+        parent_id = review_task.get("parent_task_id")
+        parent = find_task(data, parent_id) if parent_id else None
+        if parent:
+            parent["review_status"] = "changes_requested"
+            parent["status"] = "plan_review"
+            parent["blocked_reason"] = "review_parse_failed"
+            add_timeline(parent, "review_parse_failed", {})
+        return
+
+    review_task["review_result"] = {"issues": issues, "summary": review_summary}
+    review_task["review_status"] = "completed"
+
+    parent_id = review_task.get("parent_task_id")
+    parent = find_task(data, parent_id) if parent_id else None
+    if not parent:
+        return
+
+    has_critical = any(
+        isinstance(i, dict) and i.get("severity") in ("critical", "high")
+        for i in issues
+    )
+
+    if not has_critical:
+        # Review passed — mark parent as approved/completed
+        parent["review_status"] = "approved"
+        if parent.get("status") != "completed":
+            parent["status"] = "completed"
+            parent["completed_at"] = _now()
+        add_timeline(parent, "review_approved", {
+            "round": parent.get("review_round", 0),
+        })
+    else:
+        # Review failed — trigger fix cycle
+        round_num = int(parent.get("review_round", 0) or 0) + 1
+        parent["review_round"] = round_num
+
+        if round_num >= MAX_REVIEW_ROUNDS:
+            # Exceeded max rounds — escalate to human
+            parent["status"] = "plan_review"
+            parent["blocked_reason"] = "max_review_rounds_exceeded"
+            parent["review_status"] = "changes_requested"
+            add_timeline(parent, "review_max_rounds", {"round": round_num})
+        else:
+            # Inject feedback into parent and reset to pending for auto-fix
+            feedback = review_summary or ""
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                sev = issue.get("severity", "medium")
+                fpath = issue.get("file", "")
+                line = issue.get("line", 0)
+                desc = issue.get("description", "")
+                feedback += f"\n- [{sev}] {fpath}:{line} {desc}"
+            parent["_review_feedback"] = feedback
+            parent["status"] = "pending"
+            parent["assigned_worker"] = None
+            parent["started_at"] = None
+            parent["review_status"] = "changes_requested"
+            add_timeline(parent, "review_fix_requested", {
+                "round": round_num,
+                "issues_count": len(issues),
+            })
+
+
 def maybe_trigger_adversarial_review(task: dict, data: dict) -> Optional[dict]:
     if task.get("task_type") not in {"feature", "bugfix", "refactor"}:
+        return None
+    if int(task.get("review_round", 0) or 0) >= MAX_REVIEW_ROUNDS:
         return None
 
     existing = [
         t for t in data["tasks"]
-        if t.get("parent_task_id") == task["id"] and t.get("task_type") == "review"
+        if t.get("parent_task_id") == task["id"]
+        and t.get("task_type") == "review"
+        and t.get("status") not in ("completed", "failed")
     ]
     if existing:
         return None
@@ -957,11 +1061,17 @@ async def _complete_task_internal(task_id: str, *, worker_id: str, lease_id: Opt
     task["completed_at"] = _now()
     task["error_log"] = None
     task["last_exit_code"] = 0
+    task.pop("_review_feedback", None)  # Clean up consumed review feedback
     add_timeline(task, "task_completed", {"worker_id": worker_id, "summary": summary or ""})
     _complete_attempt(task, True, exit_code=0, error_log=None, commit_ids=commit_ids)
 
     worker["total_tasks_completed"] += 1
     worker["health"]["consecutive_failures"] = 0
+
+    # If this is a review task completing, parse its output and drive the
+    # Review→Fix→Verify loop (may reset parent to pending for auto-fix).
+    if task.get("task_type") == "review":
+        _handle_review_completion(task, summary or "", data, project_id)
 
     review_task = maybe_trigger_adversarial_review(task, data)
     event = emit_event(
@@ -979,6 +1089,11 @@ async def _complete_task_internal(task_id: str, *, worker_id: str, lease_id: Opt
     await broadcast_task_event(task, "task_updated", project_id)
     if review_task:
         await broadcast_task_event(review_task, "task_created", project_id)
+    # Also broadcast parent update if review changed its status
+    if task.get("task_type") == "review" and task.get("parent_task_id"):
+        parent = find_task(data, task["parent_task_id"])
+        if parent:
+            await broadcast_task_event(parent, "task_updated", project_id)
     await broadcast_event(event)
     return task
 
