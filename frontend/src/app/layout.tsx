@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import PushInit from "@/components/PushInit";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -32,6 +33,7 @@ export default function RootLayout({
       </head>
       <body className="bg-slate-950 text-slate-100 antialiased">
         {children}
+        <PushInit />
         <script
           id="sw-register"
           suppressHydrationWarning

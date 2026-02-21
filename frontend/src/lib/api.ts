@@ -360,3 +360,44 @@ export function createRealtimeChannel(onMessage: (data: any) => void, onState?: 
     },
   };
 }
+
+// --- Push notifications ---
+
+export async function getVapidPublicKey(): Promise<{ vapid_public_key: string | null; push_enabled: boolean }> {
+  return apiFetch(`${API_BASE}/notifications/vapid-public-key`);
+}
+
+export async function subscribePush(subscription: PushSubscriptionJSON): Promise<{ status: string }> {
+  return apiFetch(`${API_BASE}/notifications/subscribe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(subscription),
+  });
+}
+
+export async function initPushNotifications(): Promise<boolean> {
+  if (typeof window === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+    return false;
+  }
+
+  try {
+    const { push_enabled, vapid_public_key } = await getVapidPublicKey();
+    if (!push_enabled || !vapid_public_key) return false;
+
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return false;
+
+    const reg = await navigator.serviceWorker.ready;
+    const existing = await reg.pushManager.getSubscription();
+
+    const sub = existing ?? await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: vapid_public_key,
+    });
+
+    await subscribePush(sub.toJSON());
+    return true;
+  } catch {
+    return false;
+  }
+}
