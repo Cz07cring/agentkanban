@@ -218,6 +218,15 @@ export default function TaskDetailPanel({
           {task.status === "plan_review" && onApprovePlan && (
             <div className="p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg space-y-3">
               <div className="text-xs font-medium text-purple-400">Plan 审批</div>
+              {!task.plan_content && (
+                <div className="flex items-center gap-2 p-2 bg-slate-800/50 rounded text-xs text-slate-400">
+                  <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  AI 正在分析代码库并生成计划…
+                </div>
+              )}
               {task.plan_content && (
                 <div className="p-2 bg-slate-800/50 rounded text-xs text-slate-300 whitespace-pre-wrap max-h-40 overflow-y-auto">
                   {task.plan_content}

@@ -54,6 +54,90 @@ class WorkerRunner:
         return out[:20]
 
     @staticmethod
+    def build_plan_prompt(task: dict) -> str:
+        """Build a read-only prompt for AI plan generation."""
+        return (
+            "你是 Agent Kanban 的计划生成助手，工作在只读模式下。\n"
+            f"任务ID: {task['id']}\n"
+            f"任务标题: {task['title']}\n"
+            f"任务描述: {task.get('description', '')}\n"
+            f"任务类型: {task.get('task_type')}\n\n"
+            "请探索当前代码仓库，理解相关上下文，然后输出一个详细的有编号的实施计划。\n"
+            "要求:\n"
+            "- 每一步都以数字和点开头（如 '1. 做某事'）\n"
+            "- 步骤应具体可执行，聚焦代码改动\n"
+            "- 最多输出 8 个步骤\n"
+            "- 不要输出任何代码，只输出计划步骤\n"
+            "只输出计划内容，不要有任何前缀说明或附加内容。"
+        )
+
+    def _build_plan_cmd(self, prompt: str) -> list[str]:
+        """Build a restricted Claude CLI command for read-only plan generation."""
+        return [
+            self.claude_cli,
+            "-p",
+            prompt,
+            "--allowedTools",
+            "Read,Glob,Grep",
+            "--output-format",
+            "text",
+        ]
+
+    async def run_plan_generation(
+        self,
+        *,
+        task: dict,
+        cwd: str,
+        on_complete: Callable[[str], Awaitable[None] | None],
+        on_fail: Callable[[str], Awaitable[None] | None],
+    ) -> None:
+        """Run Claude in read-only mode to generate a plan. Calls on_complete(plan_text) on success."""
+        prompt = self.build_plan_prompt(task)
+
+        if self.exec_mode == "dry-run":
+            await asyncio.sleep(0.5)
+            fake_plan = (
+                f"1. 分析 {task['title']} 的需求和上下文\n"
+                "2. 识别需要修改的关键文件\n"
+                "3. 实施核心逻辑变更\n"
+                "4. 编写单元测试覆盖新功能\n"
+                "5. 运行构建验证无错误\n"
+                "6. 提交代码并验证"
+            )
+            await self._maybe_await(on_complete(fake_plan))
+            return
+
+        cmd = self._build_plan_cmd(prompt)
+        stdout_lines: list[str] = []
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            if proc.stdout:
+                async for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="ignore").rstrip("\n\r")
+                    stdout_lines.append(line)
+
+            stderr_data = b""
+            if proc.stderr:
+                stderr_data = await proc.stderr.read()
+
+            await proc.wait()
+            rc = proc.returncode or 0
+
+            plan_text = "\n".join(stdout_lines).strip()
+            if rc == 0 and plan_text:
+                await self._maybe_await(on_complete(plan_text))
+            else:
+                err = (stderr_data.decode("utf-8", errors="ignore") or plan_text or "plan generation failed")[-2000:]
+                await self._maybe_await(on_fail(err))
+        except Exception as exc:  # noqa: BLE001
+            await self._maybe_await(on_fail(f"Plan generation runtime error: {exc}"))
+
+    @staticmethod
     async def _maybe_await(value):
         if inspect.isawaitable(value):
             return await value
