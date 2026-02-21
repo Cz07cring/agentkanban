@@ -3,21 +3,24 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { fetchTasks } from "@/lib/api";
+import { useProjectContext } from "@/lib/project-context";
 import { Task } from "@/lib/types";
 
 export default function ReviewsPage() {
+  const { activeProjectId } = useProjectContext();
   const [reviews, setReviews] = useState<Task[]>([]);
 
   useEffect(() => {
+    const pid = activeProjectId;
     const load = async () => {
-      const data = await fetchTasks();
+      const data = await fetchTasks(undefined, pid);
       setReviews(data.tasks.filter((t) => t.task_type === "review" || t.review_status));
     };
 
     load().catch(() => undefined);
     const timer = setInterval(() => load().catch(() => undefined), 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [activeProjectId]);
 
   return (
     <div className="h-full overflow-y-auto p-6 space-y-4">

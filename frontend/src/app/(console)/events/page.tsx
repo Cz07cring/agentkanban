@@ -2,21 +2,24 @@
 
 import { useEffect, useState } from "react";
 import { ackEvent, fetchEvents } from "@/lib/api";
+import { useProjectContext } from "@/lib/project-context";
 import { EventRecord } from "@/lib/types";
 
 export default function EventsPage() {
+  const { activeProjectId } = useProjectContext();
   const [events, setEvents] = useState<EventRecord[]>([]);
   const [filter, setFilter] = useState<string>("");
 
   useEffect(() => {
+    const pid = activeProjectId;
     const load = async () => {
-      const data = await fetchEvents(filter ? { level: filter } : undefined);
+      const data = await fetchEvents(filter ? { level: filter } : undefined, pid);
       setEvents(data.events);
     };
     load().catch(() => undefined);
     const timer = setInterval(() => load().catch(() => undefined), 5000);
     return () => clearInterval(timer);
-  }, [filter]);
+  }, [filter, activeProjectId]);
 
   const handleAck = async (eventId: string) => {
     const updated = await ackEvent(eventId);

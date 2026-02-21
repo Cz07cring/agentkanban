@@ -9,18 +9,21 @@ import {
   toggleDispatcher,
   triggerDispatch,
 } from "@/lib/api";
+import { useProjectContext } from "@/lib/project-context";
 import { Task } from "@/lib/types";
 
 export default function DispatchPage() {
+  const { activeProjectId } = useProjectContext();
   const [queue, setQueue] = useState<Awaited<ReturnType<typeof fetchDispatchQueue>> | null>(null);
   const [pendingTasks, setPendingTasks] = useState<Task[]>([]);
   const [dispatch, setDispatch] = useState<DispatchStatus | null>(null);
 
   useEffect(() => {
+    const pid = activeProjectId;
     const load = async () => {
       const [queueData, taskData, dispatchData] = await Promise.all([
-        fetchDispatchQueue(),
-        fetchTasks({ status: "pending" }),
+        fetchDispatchQueue(pid),
+        fetchTasks({ status: "pending" }, pid),
         fetchDispatchStatus().catch(() => null),
       ]);
       setQueue(queueData);
@@ -31,7 +34,7 @@ export default function DispatchPage() {
     load().catch(() => undefined);
     const timer = setInterval(() => load().catch(() => undefined), 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [activeProjectId]);
 
   const handleToggle = async () => {
     const result = await toggleDispatcher().catch(() => null);

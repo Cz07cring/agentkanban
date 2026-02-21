@@ -9,6 +9,23 @@ DATA_DIR = Path(__file__).parent / "data"
 TASKS_FILE = DATA_DIR / "dev-tasks.json"
 LOCK_FILE = DATA_DIR / "dev-task.lock"
 
+# --- Multi-project paths ---
+PROJECTS_FILE = DATA_DIR / "projects.json"
+PROJECTS_DIR = DATA_DIR / "projects"
+PROJECTS_LOCK = DATA_DIR / "projects.lock"
+
+
+def project_dir(project_id: str) -> Path:
+    return PROJECTS_DIR / project_id
+
+
+def project_tasks_file(project_id: str) -> Path:
+    return project_dir(project_id) / "tasks.json"
+
+
+def project_lock_file(project_id: str) -> Path:
+    return project_dir(project_id) / "tasks.lock"
+
 # --- Dispatcher ---
 DISPATCH_INTERVAL_SEC = int(os.getenv("DISPATCH_INTERVAL_SEC", "5"))
 HEALTH_INTERVAL_SEC = int(os.getenv("HEALTH_INTERVAL_SEC", "30"))
@@ -65,6 +82,7 @@ def build_workers() -> list[dict]:
             "status": "idle",
             "capabilities": cfg["capabilities"],
             "current_task_id": None,
+            "current_project_id": None,
             "pid": None,
             "started_at": None,
             "total_tasks_completed": 0,
