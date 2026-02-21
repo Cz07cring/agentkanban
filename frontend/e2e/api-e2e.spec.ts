@@ -422,6 +422,11 @@ test.describe("Backend API E2E", () => {
       })
     ).json();
 
+    // Set retry_count near max_retries so fail endpoint exhausts retries
+    await request.patch(`${API}/api/tasks/${task.id}`, {
+      data: { retry_count: 2, max_retries: 3 },
+    });
+
     const claimRes = await request.post(`${API}/api/tasks/${task.id}/claim`, {
       data: { worker_id: "worker-0" },
     });

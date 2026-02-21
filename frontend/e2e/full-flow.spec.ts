@@ -143,7 +143,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
 
   test("01 - 页面布局与 Kanban 列", async ({ page }) => {
     await expect(
-      page.getByRole("heading", { name: "Tasks" }),
+      page.getByRole("heading", { name: "任务看板" }),
     ).toBeVisible();
     await expect(page.getByText(/个任务/)).toBeVisible();
 
@@ -241,7 +241,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
     await expect(detail.getByText("任务类型")).toBeVisible();
     await expect(detail.getByText("创建时间")).toBeVisible();
     await screenshot(page, "08a-detail-panel-open");
-    await detail.getByRole("button", { name: "×" }).click();
+    await detail.getByRole("button", { name: "关闭对话框" }).click();
     await expect(page.getByTestId("task-detail")).toBeHidden();
     await screenshot(page, "08b-detail-panel-closed");
   });
@@ -263,7 +263,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
         timeout: 5000,
       });
       await screenshot(page, "09b-status-completed");
-      await detail.getByRole("button", { name: "×" }).click();
+      await detail.getByRole("button", { name: "关闭对话框" }).click();
     });
   });
 
@@ -288,7 +288,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
         timeout: 5000,
       });
       await screenshot(page, "10b-review-completed");
-      await detail.getByRole("button", { name: "×" }).click();
+      await detail.getByRole("button", { name: "关闭对话框" }).click();
     });
   });
 
@@ -313,7 +313,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
         detail.getByRole("button", { name: "开发中" }),
       ).toBeVisible({ timeout: 5000 });
       await screenshot(page, "11b-status-retried");
-      await detail.getByRole("button", { name: "×" }).click();
+      await detail.getByRole("button", { name: "关闭对话框" }).click();
     });
   });
 
@@ -329,7 +329,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
         detail.getByRole("button", { name: "待开发" }),
       ).toBeVisible({ timeout: 5000 });
       await screenshot(page, "12-task-cancelled");
-      await detail.getByRole("button", { name: "×" }).click();
+      await detail.getByRole("button", { name: "关闭对话框" }).click();
     });
   });
 
@@ -375,7 +375,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
     await expect(detail.getByText("ghi9012")).toBeVisible();
     await expect(detail.getByText("jkl3456")).toBeVisible();
     await screenshot(page, "14-task-plan-commits");
-    await detail.getByRole("button", { name: "×" }).click();
+    await detail.getByRole("button", { name: "关闭对话框" }).click();
   });
 
   test("15 - 任务详情: 错误日志与重试次数", async ({ page }) => {
@@ -402,7 +402,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
     ).toBeVisible();
     await expect(detail.getByText(/重试次数/)).toBeVisible();
     await screenshot(page, "15-task-error-log");
-    await detail.getByRole("button", { name: "×" }).click();
+    await detail.getByRole("button", { name: "关闭对话框" }).click();
   });
 
   test("16 - 任务详情: Worker 分配信息", async ({ page }) => {
@@ -425,7 +425,7 @@ test.describe.serial("Agent Kanban - Full E2E Flow", () => {
     await expect(detail.getByText("分配 Worker")).toBeVisible();
     await expect(detail.getByText("worker-0")).toBeVisible();
     await screenshot(page, "16-task-worker-info");
-    await detail.getByRole("button", { name: "×" }).click();
+    await detail.getByRole("button", { name: "关闭对话框" }).click();
   });
 
   test("17 - 智能路由: Feature -> Claude", async ({ request }) => {

@@ -643,6 +643,11 @@ test.describe("Task Execution Protocol", () => {
     });
     const task = await taskRes.json();
 
+    // Set retry_count near max_retries so fail endpoint exhausts retries
+    await request.patch(`${API}/api/tasks/${task.id}`, {
+      data: { retry_count: 2, max_retries: 3 },
+    });
+
     // Claim
     const claimRes = await request.post(
       `${API}/api/tasks/${task.id}/claim`,
