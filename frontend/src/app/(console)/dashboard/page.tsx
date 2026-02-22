@@ -13,26 +13,8 @@ import {
   triggerDispatch,
 } from "@/lib/api";
 import { useProjectContext } from "@/lib/project-context";
-
-const statusLabels: Record<string, string> = {
-  pending: "待开发",
-  in_progress: "开发中",
-  plan_review: "待审批",
-  blocked_by_subtasks: "子任务中",
-  reviewing: "待 Review",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-const statusDot: Record<string, string> = {
-  pending: "bg-slate-500",
-  in_progress: "bg-blue-500 animate-pulse",
-  plan_review: "bg-purple-500",
-  reviewing: "bg-amber-500",
-  completed: "bg-emerald-500",
-  failed: "bg-red-500",
-};
+import { TASK_STATUS_LABELS } from "@/lib/i18n-zh";
+import { EVENT_LEVEL_BADGE_CLASSES, STATUS_DOT_CLASSES } from "@/lib/ui-tokens";
 
 export default function DashboardPage() {
   const { activeProjectId } = useProjectContext();
@@ -172,11 +154,11 @@ export default function DashboardPage() {
           <div className="space-y-1.5">
             {recentTasks.map((task) => (
               <Link key={task.id} href={`/tasks/${task.id}`} className="flex items-center gap-3 p-2 rounded-lg bg-slate-800/40 hover:bg-slate-800/70 transition-colors">
-                <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${statusDot[task.status] || "bg-slate-600"}`} />
+                <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${STATUS_DOT_CLASSES[task.status] || "bg-slate-600"}`} />
                 <div className="flex-1 min-w-0">
                   <div className="text-sm text-slate-200 truncate">{task.title}</div>
                   <div className="text-[10px] text-slate-500 mt-0.5">
-                    {task.id} · {statusLabels[task.status] || task.status}
+                    {task.id} · {TASK_STATUS_LABELS[task.status] || task.status}
                     {task.routed_engine && task.routed_engine !== "auto" ? ` · ${task.routed_engine}` : ""}
                   </div>
                 </div>
@@ -196,13 +178,7 @@ export default function DashboardPage() {
             {alerts.map((event) => (
               <div key={event.id} className="p-2 rounded-lg bg-slate-800/40 border border-slate-700/30">
                 <div className="flex items-center gap-2">
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${
-                    event.level === "critical"
-                      ? "bg-red-500/20 text-red-400"
-                      : event.level === "error"
-                        ? "bg-orange-500/20 text-orange-400"
-                        : "bg-amber-500/20 text-amber-400"
-                  }`}>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded ${EVENT_LEVEL_BADGE_CLASSES[event.level]}`}>
                     {event.level}
                   </span>
                   <span className="text-[10px] text-slate-500">{new Date(event.created_at).toLocaleString("zh-CN")}</span>

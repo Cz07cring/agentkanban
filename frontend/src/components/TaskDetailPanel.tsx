@@ -2,41 +2,12 @@
 
 import { useState, useEffect } from "react";
 import { Task, TaskStatus } from "@/lib/types";
-
-const statusLabels: Record<TaskStatus, string> = {
-  pending: "待开发",
-  in_progress: "开发中",
-  plan_review: "待审批",
-  blocked_by_subtasks: "子任务中",
-  reviewing: "待 Review",
-  completed: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
-const statusColors: Record<TaskStatus, string> = {
-  pending: "bg-slate-500/20 text-slate-400",
-  in_progress: "bg-blue-500/20 text-blue-400",
-  plan_review: "bg-purple-500/20 text-purple-400",
-  blocked_by_subtasks: "bg-indigo-500/20 text-indigo-400",
-  reviewing: "bg-amber-500/20 text-amber-400",
-  completed: "bg-emerald-500/20 text-emerald-400",
-  failed: "bg-red-500/20 text-red-400",
-  cancelled: "bg-gray-500/20 text-gray-400",
-};
-
-const engineBadge: Record<string, { bg: string; label: string }> = {
-  claude: { bg: "bg-orange-500/20 text-orange-400", label: "Claude" },
-  codex: { bg: "bg-green-500/20 text-green-400", label: "Codex" },
-  auto: { bg: "bg-slate-500/20 text-slate-400", label: "Auto" },
-};
-
-const severityColors: Record<string, string> = {
-  critical: "bg-red-500/20 text-red-400 border-red-500/30",
-  high: "bg-orange-500/20 text-orange-400 border-orange-500/30",
-  medium: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  low: "bg-slate-500/20 text-slate-400 border-slate-500/30",
-};
+import {
+  ENGINE_BADGES,
+  REVIEW_SEVERITY_BADGE_CLASSES,
+  STATUS_BADGE_CLASSES,
+} from "@/lib/ui-tokens";
+import { TASK_PRIORITY_LABELS, TASK_STATUS_LABELS, TERMS } from "@/lib/i18n-zh";
 
 // Valid status transitions
 const statusTransitions: Record<TaskStatus, TaskStatus[]> = {
@@ -75,7 +46,7 @@ export default function TaskDetailPanel({
   const [showRejectInput, setShowRejectInput] = useState(false);
 
   const engine = task.routed_engine || task.engine;
-  const badge = engineBadge[engine] || engineBadge.auto;
+  const badge = ENGINE_BADGES[engine] || ENGINE_BADGES.auto;
   const nextStatuses = statusTransitions[task.status] || [];
 
   const subTasks = allTasks?.filter((t) =>
@@ -114,16 +85,16 @@ export default function TaskDetailPanel({
               #{task.id.replace("task-", "")}
             </span>
             <span
-              className={`text-xs px-2 py-0.5 rounded ${statusColors[task.status]}`}
+              className={`text-xs px-2 py-0.5 rounded ${STATUS_BADGE_CLASSES[task.status]}`}
             >
-              {statusLabels[task.status]}
+              {TASK_STATUS_LABELS[task.status]}
             </span>
-            <span className={`text-xs px-2 py-0.5 rounded ${badge.bg}`}>
+            <span className={`text-xs px-2 py-0.5 rounded ${badge.badgeClass}`}>
               {badge.label}
             </span>
             {task.plan_mode && (
               <span className="text-xs px-2 py-0.5 rounded bg-purple-500/20 text-purple-400">
-                Plan
+                {TERMS.plan}
               </span>
             )}
             {task.review_status && (
@@ -134,7 +105,7 @@ export default function TaskDetailPanel({
                     ? "bg-red-500/20 text-red-400"
                     : "bg-amber-500/20 text-amber-400"
               }`}>
-                Review: {task.review_status === "approved" ? "通过" : task.review_status === "changes_requested" ? "需修改" : task.review_status}
+                {TERMS.review}: {task.review_status === "approved" ? "通过" : task.review_status === "changes_requested" ? "需修改" : task.review_status}
               </span>
             )}
           </div>
@@ -163,11 +134,7 @@ export default function TaskDetailPanel({
             <div>
               <span className="text-slate-500">优先级</span>
               <div className="mt-1 text-slate-300 capitalize">
-                {task.priority === "high"
-                  ? "高"
-                  : task.priority === "medium"
-                    ? "中"
-                    : "低"}
+                {TASK_PRIORITY_LABELS[task.priority]}
               </div>
             </div>
             <div>
@@ -225,7 +192,7 @@ export default function TaskDetailPanel({
           {/* Plan approval section */}
           {task.status === "plan_review" && onApprovePlan && (
             <div className="p-3 bg-purple-500/5 border border-purple-500/20 rounded-lg space-y-3">
-              <div className="text-xs font-medium text-purple-400">Plan 审批</div>
+              <div className="text-xs font-medium text-purple-400">{TERMS.plan} 审批</div>
               {!task.plan_content && (
                 <div className="flex items-center gap-2 p-2 bg-slate-800/50 rounded text-xs text-slate-400">
                   <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
@@ -242,7 +209,7 @@ export default function TaskDetailPanel({
               )}
               {task.plan_mode && ((task.acceptance_criteria?.length ?? 0) === 0 || !task.rollback_plan) && (
                 <div className="p-2 bg-amber-500/10 border border-amber-500/30 rounded text-xs text-amber-300">
-                  当前任务缺少 DoR 字段（验收标准/回滚方案），后端将阻止 Plan 审批。请先补全任务信息。
+                  当前任务缺少 DoR 字段（验收标准/回滚方案），后端将阻止 {TERMS.plan} 审批。请先补全任务信息。
                 </div>
               )}
               {!showRejectInput ? (
@@ -308,7 +275,7 @@ export default function TaskDetailPanel({
           {/* Review result */}
           {reviewResult && (
             <div>
-              <span className="text-xs text-amber-400">Review 结果</span>
+              <span className="text-xs text-amber-400">{TERMS.review} 结果</span>
               {reviewResult.summary && (
                 <div className="mt-1 p-2 bg-slate-800/50 border border-slate-700/50 rounded-lg text-xs text-slate-300">
                   {reviewResult.summary}
@@ -334,7 +301,7 @@ export default function TaskDetailPanel({
                     {reviewIssues.map((issue, idx) => (
                       <div
                         key={idx}
-                        className={`p-2 rounded border text-xs ${severityColors[issue.severity] || severityColors.low}`}
+                        className={`p-2 rounded border text-xs ${REVIEW_SEVERITY_BADGE_CLASSES[issue.severity] || REVIEW_SEVERITY_BADGE_CLASSES.low}`}
                       >
                         <div className="flex items-center gap-2">
                           <span className="font-mono text-[10px] opacity-70">
@@ -371,8 +338,8 @@ export default function TaskDetailPanel({
                     className="flex items-center gap-2 p-2 bg-slate-800/50 border border-slate-700/50 rounded text-xs"
                   >
                     <span className="text-slate-500 font-mono">{sub.id}</span>
-                    <span className={`px-1.5 py-0.5 rounded text-[10px] ${statusColors[sub.status]}`}>
-                      {statusLabels[sub.status]}
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] ${STATUS_BADGE_CLASSES[sub.status]}`}>
+                      {TASK_STATUS_LABELS[sub.status]}
                     </span>
                     <span className="text-slate-300 flex-1 truncate">{sub.title}</span>
                   </div>
@@ -384,7 +351,7 @@ export default function TaskDetailPanel({
           {/* Plan questions */}
           {task.plan_questions && task.plan_questions.length > 0 && (
             <div>
-              <span className="text-xs text-slate-500">Plan 澄清问题</span>
+              <span className="text-xs text-slate-500">{TERMS.plan} 澄清问题</span>
               <div className="mt-1 space-y-2">
                 {task.plan_questions.map((q, idx) => (
                   <div
@@ -454,9 +421,9 @@ export default function TaskDetailPanel({
               <button
                 key={status}
                 onClick={() => onUpdateStatus(task.id, status)}
-                className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${statusColors[status]} border-current/20 hover:opacity-80`}
+                className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${STATUS_BADGE_CLASSES[status]} border-current/20 hover:opacity-80`}
               >
-                {statusLabels[status]}
+                {TASK_STATUS_LABELS[status]}
               </button>
             ))}
 
@@ -476,7 +443,7 @@ export default function TaskDetailPanel({
                 onClick={() => onTriggerReview(task.id)}
                 className="text-xs px-3 py-1.5 rounded-lg bg-amber-500/20 text-amber-400 border border-amber-500/30 hover:bg-amber-500/30 transition-colors"
               >
-                触发 Review
+                触发 {TERMS.review}
               </button>
             )}
 

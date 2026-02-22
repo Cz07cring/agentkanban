@@ -1,6 +1,7 @@
 "use client";
 
 import { Task, Worker } from "@/lib/types";
+import { TERMS } from "@/lib/i18n-zh";
 
 export default function StatsBar({
   tasks,
@@ -60,7 +61,7 @@ export default function StatsBar({
             className={`w-2 h-2 rounded-full ${claudeWorkers.some((w) => w.status === "busy") ? "bg-orange-400 animate-pulse" : "bg-slate-600"}`}
           />
           <span>
-            Claude{" "}
+            {TERMS.claude}{" "}
             <span className="text-orange-400">
               {claudeWorkers.filter((w) => w.status === "busy").length}/
               {claudeWorkers.length}
@@ -72,7 +73,7 @@ export default function StatsBar({
             className={`w-2 h-2 rounded-full ${codexWorkers.some((w) => w.status === "busy") ? "bg-green-400 animate-pulse" : "bg-slate-600"}`}
           />
           <span>
-            Codex{" "}
+            {TERMS.codex}{" "}
             <span className="text-green-400">
               {codexWorkers.filter((w) => w.status === "busy").length}/
               {codexWorkers.length}

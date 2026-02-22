@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import { ackEvent, fetchEvents } from "@/lib/api";
 import { useProjectContext } from "@/lib/project-context";
 import { EventRecord } from "@/lib/types";
+import { EVENT_LEVEL_LABELS } from "@/lib/i18n-zh";
+import { EVENT_LEVEL_BADGE_CLASSES } from "@/lib/ui-tokens";
 
 export default function EventsPage() {
   const { activeProjectId } = useProjectContext();
@@ -39,10 +41,10 @@ export default function EventsPage() {
           className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-sm"
         >
           <option value="">全部级别</option>
-          <option value="info">信息</option>
-          <option value="warning">警告</option>
-          <option value="error">错误</option>
-          <option value="critical">严重</option>
+          <option value="info">{EVENT_LEVEL_LABELS.info}</option>
+          <option value="warning">{EVENT_LEVEL_LABELS.warning}</option>
+          <option value="error">{EVENT_LEVEL_LABELS.error}</option>
+          <option value="critical">{EVENT_LEVEL_LABELS.critical}</option>
         </select>
       </div>
 
@@ -56,15 +58,7 @@ export default function EventsPage() {
                 <div className="text-xs text-slate-500 mt-1">{event.type} {event.task_id ? `· ${event.task_id}` : ""}</div>
               </div>
               <div className="flex items-center gap-2">
-                <span className={`text-xs px-2 py-1 rounded ${
-                  event.level === "critical"
-                    ? "bg-red-500/20 text-red-400"
-                    : event.level === "error"
-                      ? "bg-orange-500/20 text-orange-400"
-                      : event.level === "warning"
-                        ? "bg-amber-500/20 text-amber-400"
-                        : "bg-slate-500/20 text-slate-400"
-                }`}>
+                <span className={`text-xs px-2 py-1 rounded ${EVENT_LEVEL_BADGE_CLASSES[event.level]}`}>
                   {event.level}
                 </span>
                 {!event.acknowledged ? (

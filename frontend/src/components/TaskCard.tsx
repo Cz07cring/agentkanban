@@ -1,6 +1,15 @@
 "use client";
 
 import { Task } from "@/lib/types";
+import {
+  ENGINE_BADGES,
+  PRIORITY_BADGE_CLASSES,
+} from "@/lib/ui-tokens";
+import {
+  TASK_PRIORITY_LABELS,
+  TASK_TYPE_LABELS,
+  TERMS,
+} from "@/lib/i18n-zh";
 
 function formatTime(dateStr: string): string {
   const date = new Date(dateStr);
@@ -22,34 +31,6 @@ function getElapsedTime(startedAt: string, completedAt: string | null): string {
   return `${hours} 小时 ${mins % 60} 分钟`;
 }
 
-const priorityColors: Record<string, string> = {
-  high: "bg-red-500/20 text-red-400 border-red-500/30",
-  medium: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  low: "bg-slate-500/20 text-slate-400 border-slate-500/30",
-};
-
-const priorityLabels: Record<string, string> = {
-  high: "高",
-  medium: "中",
-  low: "低",
-};
-
-const engineBadge: Record<string, { bg: string; label: string }> = {
-  claude: { bg: "bg-orange-500/20 text-orange-400", label: "Claude" },
-  codex: { bg: "bg-green-500/20 text-green-400", label: "Codex" },
-  auto: { bg: "bg-slate-500/20 text-slate-400", label: "Auto" },
-};
-
-const taskTypeLabels: Record<string, string> = {
-  feature: "功能",
-  bugfix: "修复",
-  review: "审查",
-  refactor: "重构",
-  analysis: "分析",
-  plan: "计划",
-  audit: "审计",
-};
-
 export default function TaskCard({
   task,
   onExpand,
@@ -58,7 +39,7 @@ export default function TaskCard({
   onExpand?: (task: Task) => void;
 }) {
   const engine = task.routed_engine || task.engine;
-  const badge = engineBadge[engine] || engineBadge.auto;
+  const badge = ENGINE_BADGES[engine] || ENGINE_BADGES.auto;
 
   return (
     <div
@@ -74,10 +55,10 @@ export default function TaskCard({
         <div className="flex gap-1">
           {task.plan_mode && (
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400">
-              Plan
+              {TERMS.plan}
             </span>
           )}
-          <span className={`text-[10px] px-1.5 py-0.5 rounded ${badge.bg}`}>
+          <span className={`text-[10px] px-1.5 py-0.5 rounded ${badge.badgeClass}`}>
             {badge.label}
           </span>
         </div>
@@ -94,12 +75,12 @@ export default function TaskCard({
       <div className="flex items-center justify-between">
         <div className="flex gap-1.5">
           <span
-            className={`text-[10px] px-1.5 py-0.5 rounded border ${priorityColors[task.priority]}`}
+            className={`text-[10px] px-1.5 py-0.5 rounded border ${PRIORITY_BADGE_CLASSES[task.priority]}`}
           >
-            {priorityLabels[task.priority]}
+            {TASK_PRIORITY_LABELS[task.priority]}
           </span>
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700/50 text-slate-400">
-            {taskTypeLabels[task.task_type] || task.task_type}
+            {TASK_TYPE_LABELS[task.task_type] || task.task_type}
           </span>
         </div>
       </div>
