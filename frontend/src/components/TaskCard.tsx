@@ -1,5 +1,6 @@
 "use client";
 
+import { KeyboardEvent } from "react";
 import { Task } from "@/lib/types";
 
 function formatTime(dateStr: string): string {
@@ -60,12 +61,23 @@ export default function TaskCard({
   const engine = task.routed_engine || task.engine;
   const badge = engineBadge[engine] || engineBadge.auto;
 
+  const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!onExpand) return;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onExpand(task);
+    }
+  };
+
   return (
     <div
-      className="bg-slate-800/80 border border-slate-700/50 rounded-lg p-3 hover:border-slate-600/80 transition-all cursor-pointer group"
+      className="bg-slate-800/80 border border-slate-700/50 rounded-lg p-3 hover:border-slate-600/80 transition-all cursor-pointer group focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/80 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900"
       data-task-id={task.id}
       data-task-status={task.status}
+      role={onExpand ? "button" : undefined}
+      tabIndex={onExpand ? 0 : undefined}
       onClick={() => onExpand?.(task)}
+      onKeyDown={handleKeyDown}
     >
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs text-slate-500 font-mono">

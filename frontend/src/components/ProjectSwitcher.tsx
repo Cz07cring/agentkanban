@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { KeyboardEvent, useCallback, useEffect, useId, useRef, useState } from "react";
 import { useProjectContext } from "@/lib/project-context";
 import { createProject } from "@/lib/api";
 
@@ -15,6 +15,18 @@ export default function ProjectSwitcher() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
   const ref = useRef<HTMLDivElement>(null);
+  const listboxId = useId();
+  const [highlightedIndex, setHighlightedIndex] = useState(-1);
+
+  useEffect(() => {
+    if (!open) {
+      setHighlightedIndex(-1);
+      return;
+    }
+
+    const activeIndex = projects.findIndex((proj) => proj.id === activeProjectId);
+    setHighlightedIndex(activeIndex >= 0 ? activeIndex : 0);
+  }, [open, projects, activeProjectId]);
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -26,6 +38,73 @@ export default function ProjectSwitcher() {
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, []);
+
+
+  const selectProjectAt = useCallback(
+    (index: number) => {
+      const project = projects[index];
+      if (!project) return;
+      setActiveProjectId(project.id);
+      setOpen(false);
+    },
+    [projects, setActiveProjectId],
+  );
+
+  const handleTriggerKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      const total = projects.length || 1;
+      setHighlightedIndex((prev) => {
+        const start = prev < 0 ? 0 : prev;
+        return (start + delta + total) % total;
+      });
+      return;
+    }
+
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+      selectProjectAt(highlightedIndex >= 0 ? highlightedIndex : 0);
+      return;
+    }
+
+    if (event.key === "Escape") {
+      setOpen(false);
+    }
+  };
+
+  const handleListboxKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      const total = projects.length || 1;
+      setHighlightedIndex((prev) => {
+        const start = prev < 0 ? 0 : prev;
+        return (start + delta + total) % total;
+      });
+      return;
+    }
+
+    if (event.key === "Enter") {
+      event.preventDefault();
+      selectProjectAt(highlightedIndex >= 0 ? highlightedIndex : 0);
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setOpen(false);
+    }
+  };
 
   const handleCreate = useCallback(async () => {
     if (!name.trim() || !repoPath.trim()) return;
@@ -55,6 +134,10 @@ export default function ProjectSwitcher() {
     <div ref={ref} className="relative mb-4">
       <button
         onClick={() => setOpen(!open)}
+        onKeyDown={handleTriggerKeyDown}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={listboxId}
         className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg text-sm bg-slate-800/60 hover:bg-slate-800 border border-slate-700/50 transition-colors"
       >
         <span className="truncate text-slate-200">
@@ -73,18 +156,32 @@ export default function ProjectSwitcher() {
 
       {open && (
         <div className="absolute left-0 right-0 top-full mt-1 z-50 bg-slate-800 border border-slate-700/50 rounded-lg shadow-xl overflow-hidden">
-          <div className="max-h-60 overflow-y-auto">
-            {projects.map((proj) => (
+          <div
+            id={listboxId}
+            role="listbox"
+            tabIndex={0}
+            aria-activedescendant={highlightedIndex >= 0 ? `${listboxId}-option-${highlightedIndex}` : undefined}
+            onKeyDown={handleListboxKeyDown}
+            className="max-h-60 overflow-y-auto outline-none"
+          >
+            {projects.map((proj, index) => {
+              const isSelected = proj.id === activeProjectId;
+              const isActive = index === highlightedIndex;
+
+              return (
               <button
+                id={`${listboxId}-option-${index}`}
+                role="option"
+                aria-selected={isSelected}
                 key={proj.id}
-                onClick={() => {
-                  setActiveProjectId(proj.id);
-                  setOpen(false);
-                }}
+                onMouseEnter={() => setHighlightedIndex(index)}
+                onClick={() => selectProjectAt(index)}
                 className={`w-full text-left px-3 py-2 text-sm transition-colors ${
-                  proj.id === activeProjectId
+                  isSelected
                     ? "bg-blue-500/15 text-blue-300"
-                    : "text-slate-300 hover:bg-slate-700/60"
+                    : isActive
+                      ? "bg-slate-700/70 text-slate-200"
+                      : "text-slate-300 hover:bg-slate-700/60"
                 }`}
               >
                 <div className="font-medium truncate">{proj.name}</div>
@@ -92,7 +189,8 @@ export default function ProjectSwitcher() {
                   {proj.task_count} 任务 · {proj.repo_path.split("/").pop()}
                 </div>
               </button>
-            ))}
+            );
+            })}
           </div>
 
           <div className="border-t border-slate-700/50">

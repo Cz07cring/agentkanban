@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { ReactNode, useState } from "react";
+import { ReactNode, useEffect, useRef, useState } from "react";
 import EngineStatus from "./EngineStatus";
 import ProjectSwitcher from "./ProjectSwitcher";
 
@@ -20,6 +20,71 @@ const NAV_ITEMS = [
 export default function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const sidebarRef = useRef<HTMLElement>(null);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    return () => {
+      document.body.style.overflow = originalOverflow;
+    };
+  }, [mobileOpen]);
+
+  useEffect(() => {
+    if (!mobileOpen || !sidebarRef.current) return;
+
+    const sidebar = sidebarRef.current;
+    const focusableSelector = [
+      'a[href]',
+      'button:not([disabled])',
+      'input:not([disabled])',
+      'select:not([disabled])',
+      'textarea:not([disabled])',
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(",");
+
+    const getFocusable = () =>
+      Array.from(sidebar.querySelectorAll<HTMLElement>(focusableSelector));
+
+    const focusableElements = getFocusable();
+    focusableElements[0]?.focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMobileOpen(false);
+        menuButtonRef.current?.focus();
+        return;
+      }
+
+      if (event.key !== "Tab") return;
+
+      const elements = getFocusable();
+      if (elements.length === 0) {
+        event.preventDefault();
+        return;
+      }
+
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      const active = document.activeElement;
+
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [mobileOpen]);
 
   return (
     <div className="h-screen flex bg-slate-950 text-slate-100">
@@ -33,6 +98,8 @@ export default function AppShell({ children }: { children: ReactNode }) {
 
       {/* Sidebar */}
       <aside
+        id="app-sidebar"
+        ref={sidebarRef}
         className={`
           fixed inset-y-0 left-0 z-50 w-56 border-r border-slate-800/70 bg-slate-900/95 backdrop-blur-sm p-4 flex flex-col
           transition-transform duration-200
@@ -99,7 +166,11 @@ export default function AppShell({ children }: { children: ReactNode }) {
         {/* Mobile top bar */}
         <div className="md:hidden flex items-center justify-between px-4 py-3 border-b border-slate-800/70 bg-slate-900/80">
           <button
+            ref={menuButtonRef}
             onClick={() => setMobileOpen(true)}
+            aria-label="打开导航菜单"
+            aria-expanded={mobileOpen}
+            aria-controls="app-sidebar"
             className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 transition-colors"
           >
             <svg
