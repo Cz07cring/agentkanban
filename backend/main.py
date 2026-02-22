@@ -498,35 +498,13 @@ def _parse_review_json(text: str) -> tuple[list[dict] | None, str]:
         return None, ""
 
 
-def _handle_review_completion(
-    review_task: dict, summary: str, data: dict, project_id: str | None,
+def _apply_review_to_parent(
+    issues: list[dict], review_summary: str, parent: dict,
 ) -> None:
-    """Parse review output and drive the Review→Fix→Verify loop."""
-    issues, review_summary = _parse_review_json(summary)
+    """Drive the Review->Fix->Verify loop on the parent task.
 
-    # Unparseable review output — escalate to human, never auto-approve
-    if issues is None:
-        review_task["review_result"] = {
-            "issues": [], "summary": "parse_failed", "raw": summary[:2000],
-        }
-        review_task["review_status"] = "completed"
-        parent_id = review_task.get("parent_task_id")
-        parent = find_task(data, parent_id) if parent_id else None
-        if parent:
-            parent["review_status"] = "changes_requested"
-            parent["status"] = "plan_review"
-            parent["blocked_reason"] = "review_parse_failed"
-            add_timeline(parent, "review_parse_failed", {})
-        return
-
-    review_task["review_result"] = {"issues": issues, "summary": review_summary}
-    review_task["review_status"] = "completed"
-
-    parent_id = review_task.get("parent_task_id")
-    parent = find_task(data, parent_id) if parent_id else None
-    if not parent:
-        return
-
+    Called from both worker-execution and manual API review-submit paths.
+    """
     has_critical = any(
         isinstance(i, dict) and i.get("severity") in ("critical", "high")
         for i in issues
@@ -572,6 +550,38 @@ def _handle_review_completion(
                 "round": round_num,
                 "issues_count": len(issues),
             })
+
+
+def _handle_review_completion(
+    review_task: dict, summary: str, data: dict, project_id: str | None,
+) -> None:
+    """Parse review output and drive the Review->Fix->Verify loop."""
+    issues, review_summary = _parse_review_json(summary)
+
+    # Unparseable review output — escalate to human, never auto-approve
+    if issues is None:
+        review_task["review_result"] = {
+            "issues": [], "summary": "parse_failed", "raw": summary[:2000],
+        }
+        review_task["review_status"] = "completed"
+        parent_id = review_task.get("parent_task_id")
+        parent = find_task(data, parent_id) if parent_id else None
+        if parent:
+            parent["review_status"] = "changes_requested"
+            parent["status"] = "plan_review"
+            parent["blocked_reason"] = "review_parse_failed"
+            add_timeline(parent, "review_parse_failed", {})
+        return
+
+    review_task["review_result"] = {"issues": issues, "summary": review_summary}
+    review_task["review_status"] = "completed"
+
+    parent_id = review_task.get("parent_task_id")
+    parent = find_task(data, parent_id) if parent_id else None
+    if not parent:
+        return
+
+    _apply_review_to_parent(issues, review_summary, parent)
 
 
 def maybe_trigger_adversarial_review(task: dict, data: dict) -> Optional[dict]:
@@ -1920,37 +1930,21 @@ async def submit_review(task_id: str, body: ReviewResult):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task["review_result"] = body.model_dump()
+    review_data = body.model_dump()
+    task["review_result"] = review_data
     task["review_status"] = "completed"
     task["status"] = "completed"
     task["completed_at"] = _now()
     add_timeline(task, "review_completed", {"summary": body.summary or ""})
 
+    # Use shared review->fix->verify logic for parent task
     parent_id = task.get("parent_task_id")
     if parent_id:
         parent = find_task(data, parent_id)
         if parent:
-            has_critical = any(issue.get("severity") in ("critical", "high") for issue in (body.model_dump().get("issues") or []))
-            if has_critical:
-                parent["review_status"] = "changes_requested"
-                parent["status"] = "failed"
-                parent["error_log"] = f"Review failed: {body.summary or 'critical issues'}"
-                parent["review_round"] = int(parent.get("review_round", 0) or 0) + 1
-                if parent["review_round"] >= MAX_REVIEW_ROUNDS:
-                    parent["status"] = "plan_review"
-                    parent["blocked_reason"] = "max_review_rounds_exceeded"
-                add_timeline(parent, "review_failed", {"round": parent.get("review_round")})
-                asyncio.ensure_future(_maybe_push(
-                    "Review 发现严重问题",
-                    f"任务 {parent_id} 的 Review 发现 critical/high 问题: {body.summary or ''}",
-                    {"task_id": parent_id, "url": f"/tasks/{parent_id}"},
-                ))
-            else:
-                parent["review_status"] = "approved"
-                if parent.get("status") != "completed":
-                    parent["status"] = "completed"
-                    parent["completed_at"] = _now()
-                add_timeline(parent, "review_approved", {})
+            _apply_review_to_parent(
+                review_data.get("issues") or [], body.summary or "", parent,
+            )
             await broadcast_task_event(parent, "task_updated")
 
     event = emit_event(data, "review_submitted", task_id=task_id, message="Review submitted")
