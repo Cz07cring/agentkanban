@@ -16,6 +16,7 @@ export default function ProjectSwitcher() {
   const [error, setError] = useState("");
   const ref = useRef<HTMLDivElement>(null);
   const listboxId = useId();
+  const listboxRef = useRef<HTMLDivElement>(null);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
 
   useEffect(() => {
@@ -87,10 +88,17 @@ export default function ProjectSwitcher() {
       event.preventDefault();
       const delta = event.key === "ArrowDown" ? 1 : -1;
       const total = projects.length || 1;
+      let nextIndex = 0;
       setHighlightedIndex((prev) => {
         const start = prev < 0 ? 0 : prev;
-        return (start + delta + total) % total;
+        nextIndex = (start + delta + total) % total;
+        return nextIndex;
       });
+
+      const nextOption = listboxRef.current?.querySelector<HTMLButtonElement>(
+        `[data-option-index="${nextIndex}"]`,
+      );
+      nextOption?.focus();
       return;
     }
 
@@ -161,6 +169,7 @@ export default function ProjectSwitcher() {
           <div
             id={listboxId}
             role="listbox"
+            ref={listboxRef}
             tabIndex={0}
             aria-activedescendant={highlightedIndex >= 0 ? `${listboxId}-option-${highlightedIndex}` : undefined}
             onKeyDown={handleListboxKeyDown}
