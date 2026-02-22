@@ -30,6 +30,11 @@ export default function KanbanBoard({
   const [mobileViewMode, setMobileViewMode] = useState<"single" | "all">("single");
   const [activeColumn, setActiveColumn] = useState<TaskStatus>("pending");
 
+  const firstNonEmptyColumn = useMemo(
+    () => columns.find((column) => column.tasks.length > 0)?.id,
+    [columns],
+  );
+
   useEffect(() => {
     const media = window.matchMedia("(max-width: 767px)");
     const update = () => {
@@ -44,6 +49,20 @@ export default function KanbanBoard({
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   }, []);
+
+  useEffect(() => {
+    if (!firstNonEmptyColumn) {
+      return;
+    }
+
+    const activeColumnHasTasks = columns.some(
+      (column) => column.id === activeColumn && column.tasks.length > 0,
+    );
+
+    if (!activeColumnHasTasks) {
+      setActiveColumn(firstNonEmptyColumn);
+    }
+  }, [activeColumn, columns, firstNonEmptyColumn]);
 
   const visibleColumns = isMobile && mobileViewMode === "single"
     ? columns.filter((column) => column.id === activeColumn)
