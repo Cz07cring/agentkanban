@@ -44,6 +44,12 @@ interface AiQuestion {
   options: string[];
 }
 
+const DEMAND_TEMPLATES = [
+  "做一个支持语音输入需求、自动生成 3 个可执行方案的项目启动页",
+  "把现有看板升级为移动端优先，支持单列切换和关键操作悬浮入口",
+  "增加从需求访谈到任务拆分的全链路自动化，包含验收标准和风险评估",
+];
+
 function buildPlanOptions(goal: GoalMode, timeline: TimelineMode, scope: ScopeMode): PlanOption[] {
   const scopeText = scope === "web" ? "Web" : scope === "mobile" ? "移动端" : "Web + 移动端";
   const fastCycle = timeline === "mvp_1w" ? "5~7天" : timeline === "stable_2w" ? "7~10天" : "10~14天";
@@ -99,6 +105,7 @@ export default function ProjectsPage() {
   const [desc, setDesc] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
+  const [listError, setListError] = useState("");
   const [repoCheck, setRepoCheck] = useState<{
     status: "idle" | "checking" | "ok" | "error";
     message?: string;
@@ -126,16 +133,21 @@ export default function ProjectsPage() {
   const [editDesc, setEditDesc] = useState("");
 
   const load = useCallback(async () => {
+    setLoading(true);
     try {
       const { projects: list } = await fetchProjects();
       setProjects(list);
+      setListError("");
+    } catch (err) {
+      setProjects([]);
+      setListError(err instanceof Error ? err.message : "加载项目失败，请稍后重试");
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    load();
+    load().catch(() => undefined);
   }, [load]);
 
   const planOptions = useMemo(
@@ -257,6 +269,20 @@ export default function ProjectsPage() {
   const canCreateProject = useMemo(() => {
     return !!name.trim() && !!repoPath.trim() && missingItems.length === 0;
   }, [name, repoPath, missingItems]);
+
+  const createProgress = useMemo(() => {
+    const basicsReady = !!name.trim() && !!repoPath.trim();
+    const demandReady = !!demand.trim();
+    const optionReady = !!selectedPlan && (selectedPlan.acceptance?.length ?? 0) > 0;
+    const steps = [basicsReady, demandReady, optionReady];
+    return {
+      done: steps.filter(Boolean).length,
+      total: steps.length,
+      basicsReady,
+      demandReady,
+      optionReady,
+    };
+  }, [name, repoPath, demand, selectedPlan]);
 
   const initBrief = useMemo(() => {
     if (!demand.trim() || !selectedPlan) return null;
@@ -392,30 +418,74 @@ export default function ProjectsPage() {
         </button>
       </div>
 
+      {listError && !showCreate && (
+        <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200 flex items-center justify-between gap-3">
+          <span>项目列表加载失败：{listError}</span>
+          <button
+            onClick={() => load().catch(() => undefined)}
+            className="underline text-amber-100 hover:text-white"
+          >
+            重试
+          </button>
+        </div>
+      )}
+
       {showCreate && (
         <div className="mb-5 p-3 md:p-4 bg-slate-800/60 border border-slate-700/50 rounded-lg space-y-4">
           <h2 className="text-sm font-medium text-slate-200">新建项目（需求访谈 + 方案选择）</h2>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="项目名称"
-              className="px-3 py-2.5 text-sm bg-slate-900 border border-slate-600 rounded-lg text-slate-200 placeholder-slate-500"
-            />
-            <div className="flex gap-2">
-              <input
-                value={repoPath}
-                onChange={(e) => {
-                  setRepoPath(e.target.value);
-                  if (repoCheck.status !== "idle") setRepoCheck({ status: "idle" });
-                }}
-                placeholder="Git 仓库绝对路径"
-                className="flex-1 px-3 py-2.5 text-sm bg-slate-900 border border-slate-600 rounded-lg text-slate-200 placeholder-slate-500"
+          <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 px-3 py-2.5 space-y-1">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-xs text-blue-200">创建进度</div>
+              <div className="text-xs text-blue-300 font-medium">
+                {createProgress.done}/{createProgress.total}
+              </div>
+            </div>
+            <div className="h-1.5 rounded-full bg-slate-700/70 overflow-hidden">
+              <div
+                className="h-full bg-blue-500 transition-all"
+                style={{ width: `${(createProgress.done / createProgress.total) * 100}%` }}
               />
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-1 text-[11px]">
+              <div className={`${createProgress.basicsReady ? "text-emerald-300" : "text-slate-400"}`}>
+                {createProgress.basicsReady ? "✓" : "○"} 基础信息
+              </div>
+              <div className={`${createProgress.demandReady ? "text-emerald-300" : "text-slate-400"}`}>
+                {createProgress.demandReady ? "✓" : "○"} 需求输入
+              </div>
+              <div className={`${createProgress.optionReady ? "text-emerald-300" : "text-slate-400"}`}>
+                {createProgress.optionReady ? "✓" : "○"} 方案确认
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label className="space-y-1">
+              <div className="text-xs text-slate-400">项目名称</div>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="例如：Agent 需求访谈中台"
+                className="w-full px-3 py-2.5 text-sm bg-slate-900 border border-slate-600 rounded-lg text-slate-200 placeholder-slate-500"
+              />
+            </label>
+            <div className="flex gap-2">
+              <label className="flex-1 space-y-1">
+                <div className="text-xs text-slate-400">仓库路径</div>
+                <input
+                  value={repoPath}
+                  onChange={(e) => {
+                    setRepoPath(e.target.value);
+                    if (repoCheck.status !== "idle") setRepoCheck({ status: "idle" });
+                  }}
+                  placeholder="Git 仓库绝对路径"
+                  className="w-full px-3 py-2.5 text-sm bg-slate-900 border border-slate-600 rounded-lg text-slate-200 placeholder-slate-500"
+                />
+              </label>
               <button
                 onClick={handleValidateRepo}
-                className="px-3 py-2.5 text-xs bg-slate-700 hover:bg-slate-600 rounded-lg text-slate-200 transition-colors min-w-16"
+                className="self-end px-3 py-2.5 text-xs bg-slate-700 hover:bg-slate-600 rounded-lg text-slate-200 transition-colors min-w-16"
                 disabled={repoCheck.status === "checking"}
               >
                 {repoCheck.status === "checking" ? "验证中" : "验证"}
@@ -447,6 +517,17 @@ export default function ProjectsPage() {
                 placeholder="请输入一句需求（支持语音输入）"
                 className="w-full px-3 py-2 text-sm bg-slate-900 border border-slate-600 rounded-lg text-slate-200 placeholder-slate-500"
               />
+              <div className="flex flex-wrap gap-2">
+                {DEMAND_TEMPLATES.map((tpl, idx) => (
+                  <button
+                    key={tpl}
+                    onClick={() => setDemand(tpl)}
+                    className="text-[11px] px-2 py-1 rounded border border-slate-600/80 text-slate-300 hover:text-slate-100 hover:border-slate-500"
+                  >
+                    模板 {idx + 1}
+                  </button>
+                ))}
+              </div>
               <div className="rounded-md border border-slate-700/60 bg-slate-900/50 p-2 space-y-1">
                 <div className="text-[11px] text-slate-300">语音输入区（先说后看，自动转文字可编辑）</div>
                 <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
@@ -607,6 +688,7 @@ export default function ProjectsPage() {
               onClick={handleCreate}
               disabled={creating || !canCreateProject}
               className="px-4 py-2.5 text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-white transition-colors"
+              title={!canCreateProject ? `请先补齐：${missingItems.join("、") || "基础信息"}` : ""}
             >
               {creating ? "创建中..." : "创建项目并切换"}
             </button>
