@@ -96,7 +96,9 @@ export default function ProjectSwitcher() {
 
     if (event.key === "Enter") {
       event.preventDefault();
-      selectProjectAt(highlightedIndex >= 0 ? highlightedIndex : 0);
+      const focusedOption = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-option-index]");
+      const focusedIndex = focusedOption ? Number(focusedOption.dataset.optionIndex) : -1;
+      selectProjectAt(focusedIndex >= 0 ? focusedIndex : highlightedIndex >= 0 ? highlightedIndex : 0);
       return;
     }
 
@@ -171,9 +173,11 @@ export default function ProjectSwitcher() {
               return (
               <button
                 id={`${listboxId}-option-${index}`}
+                data-option-index={index}
                 role="option"
                 aria-selected={isSelected}
                 key={proj.id}
+                onFocus={() => setHighlightedIndex(index)}
                 onMouseEnter={() => setHighlightedIndex(index)}
                 onClick={() => selectProjectAt(index)}
                 className={`w-full text-left px-3 py-2 text-sm transition-colors ${
