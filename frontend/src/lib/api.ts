@@ -1,6 +1,10 @@
-import { EventRecord, Task, TaskAttempt, TaskTimelineEntry, TasksData, Worker } from "./types";
+import { EventRecord, Project, Task, TaskAttempt, TaskTimelineEntry, TasksData, Worker } from "./types";
 
 const API_BASE = "/api";
+
+function projectBase(projectId?: string): string {
+  return projectId ? `${API_BASE}/projects/${projectId}` : API_BASE;
+}
 
 function toQuery(params?: Record<string, string | undefined>): string {
   if (!params) return "";
@@ -37,12 +41,14 @@ export async function fetchTasks(params?: {
   engine?: string;
   priority?: string;
   q?: string;
-}): Promise<TasksData> {
-  return apiFetch<TasksData>(`${API_BASE}/tasks${toQuery(params)}`);
+}, projectId?: string): Promise<TasksData> {
+  const base = projectBase(projectId);
+  return apiFetch<TasksData>(`${base}/tasks${toQuery(params)}`);
 }
 
-export async function fetchTask(taskId: string): Promise<Task> {
-  return apiFetch<Task>(`${API_BASE}/tasks/${taskId}`);
+export async function fetchTask(taskId: string, projectId?: string): Promise<Task> {
+  const base = projectBase(projectId);
+  return apiFetch<Task>(`${base}/tasks/${taskId}`);
 }
 
 export async function createTask(input: {
@@ -51,8 +57,9 @@ export async function createTask(input: {
   engine: string;
   plan_mode: boolean;
   priority?: "high" | "medium" | "low";
-}): Promise<Task> {
-  return apiFetch<Task>(`${API_BASE}/tasks`, {
+}, projectId?: string): Promise<Task> {
+  const base = projectBase(projectId);
+  return apiFetch<Task>(`${base}/tasks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -61,33 +68,38 @@ export async function createTask(input: {
 
 export async function updateTask(
   taskId: string,
-  updates: Record<string, unknown>
+  updates: Record<string, unknown>,
+  projectId?: string,
 ): Promise<Task> {
-  return apiFetch<Task>(`${API_BASE}/tasks/${taskId}`, {
+  const base = projectBase(projectId);
+  return apiFetch<Task>(`${base}/tasks/${taskId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(updates),
   });
 }
 
-export async function deleteTask(taskId: string): Promise<void> {
-  await apiFetch<{ deleted: string }>(`${API_BASE}/tasks/${taskId}`, {
+export async function deleteTask(taskId: string, projectId?: string): Promise<void> {
+  const base = projectBase(projectId);
+  await apiFetch<{ deleted: string }>(`${base}/tasks/${taskId}`, {
     method: "DELETE",
   });
 }
 
-export async function fetchTaskTimeline(taskId: string): Promise<{
+export async function fetchTaskTimeline(taskId: string, projectId?: string): Promise<{
   task_id: string;
   timeline: TaskTimelineEntry[];
 }> {
-  return apiFetch(`${API_BASE}/tasks/${taskId}/timeline`);
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/tasks/${taskId}/timeline`);
 }
 
-export async function fetchTaskAttempts(taskId: string): Promise<{
+export async function fetchTaskAttempts(taskId: string, projectId?: string): Promise<{
   task_id: string;
   attempts: TaskAttempt[];
 }> {
-  return apiFetch(`${API_BASE}/tasks/${taskId}/attempts`);
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/tasks/${taskId}/attempts`);
 }
 
 export async function fetchWorkers(): Promise<{ workers: Worker[] }> {
@@ -102,7 +114,7 @@ export async function fetchHealth(): Promise<{
   return apiFetch(`${API_BASE}/health`);
 }
 
-export async function fetchDispatchQueue(): Promise<{
+export async function fetchDispatchQueue(projectId?: string): Promise<{
   summary: Record<string, number>;
   total: number;
   blocked: { task_id: string; reason?: string; depends_on: string[] }[];
@@ -110,23 +122,28 @@ export async function fetchDispatchQueue(): Promise<{
   retries: { task_id: string; retry_count: number; max_retries: number; last_exit_code: number | null }[];
   engines: Record<string, boolean>;
 }> {
-  return apiFetch(`${API_BASE}/dispatcher/queue`);
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/dispatcher/queue`);
 }
 
-export async function dispatchTask(taskId: string): Promise<Task> {
-  return apiFetch(`${API_BASE}/tasks/${taskId}/dispatch`, { method: "POST" });
+export async function dispatchTask(taskId: string, projectId?: string): Promise<Task> {
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/tasks/${taskId}/dispatch`, { method: "POST" });
 }
 
-export async function triggerReview(taskId: string): Promise<Task> {
-  return apiFetch(`${API_BASE}/tasks/${taskId}/review`, { method: "POST" });
+export async function triggerReview(taskId: string, projectId?: string): Promise<Task> {
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/tasks/${taskId}/review`, { method: "POST" });
 }
 
 export async function approvePlan(
   taskId: string,
   approved: boolean,
-  feedback?: string
+  feedback?: string,
+  projectId?: string,
 ): Promise<{ task: Task; sub_tasks: Task[] }> {
-  return apiFetch(`${API_BASE}/tasks/${taskId}/approve-plan`, {
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/tasks/${taskId}/approve-plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ approved, feedback }),
@@ -141,17 +158,20 @@ export async function decomposeTask(
     task_type?: string;
     engine?: string;
     priority?: string;
-  }[]
+  }[],
+  projectId?: string,
 ): Promise<{ parent: Task; sub_tasks: Task[] }> {
-  return apiFetch(`${API_BASE}/tasks/${taskId}/decompose`, {
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/tasks/${taskId}/decompose`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sub_tasks: subTasks }),
   });
 }
 
-export async function retryTask(taskId: string): Promise<Task> {
-  return apiFetch(`${API_BASE}/tasks/${taskId}/retry`, {
+export async function retryTask(taskId: string, projectId?: string): Promise<Task> {
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/tasks/${taskId}/retry`, {
     method: "POST",
   });
 }
@@ -194,7 +214,7 @@ export async function failTask(
   });
 }
 
-export async function fetchStats(): Promise<{
+export async function fetchStats(projectId?: string): Promise<{
   total_tasks: number;
   by_status: Record<string, number>;
   by_type: Record<string, number>;
@@ -212,7 +232,8 @@ export async function fetchStats(): Promise<{
   >;
   meta: Record<string, unknown>;
 }> {
-  return apiFetch(`${API_BASE}/stats`);
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/stats`);
 }
 
 export async function fetchEnginesHealth(): Promise<{
@@ -264,12 +285,14 @@ export async function fetchWorkerLogs(workerId: string): Promise<{ worker_id: st
   return apiFetch(`${API_BASE}/workers/${workerId}/logs`);
 }
 
-export async function fetchEvents(params?: { level?: string; task_id?: string }): Promise<{ events: EventRecord[] }> {
-  return apiFetch(`${API_BASE}/events${toQuery(params)}`);
+export async function fetchEvents(params?: { level?: string; task_id?: string }, projectId?: string): Promise<{ events: EventRecord[] }> {
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/events${toQuery(params)}`);
 }
 
-export async function ackEvent(eventId: string, by = "user"): Promise<EventRecord> {
-  return apiFetch(`${API_BASE}/events/${eventId}/ack`, {
+export async function ackEvent(eventId: string, by = "user", projectId?: string): Promise<EventRecord> {
+  const base = projectBase(projectId);
+  return apiFetch(`${base}/events/${eventId}/ack`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ by }),
@@ -359,4 +382,79 @@ export function createRealtimeChannel(onMessage: (data: any) => void, onState?: 
       ws = null;
     },
   };
+}
+
+// --- Project CRUD ---
+export async function fetchProjects(): Promise<{ projects: Project[] }> {
+  return apiFetch(`${API_BASE}/projects`);
+}
+
+export async function createProject(input: {
+  name: string;
+  description: string;
+  repo_path: string;
+}): Promise<Project> {
+  return apiFetch<Project>(`${API_BASE}/projects`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateProject(
+  projectId: string,
+  updates: { name?: string; description?: string; repo_path?: string },
+): Promise<Project> {
+  return apiFetch<Project>(`${API_BASE}/projects/${projectId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(updates),
+  });
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  await apiFetch<{ deleted: string }>(`${API_BASE}/projects/${projectId}`, {
+    method: "DELETE",
+  });
+}
+
+// --- Push notifications ---
+
+export async function getVapidPublicKey(): Promise<{ vapid_public_key: string | null; push_enabled: boolean }> {
+  return apiFetch(`${API_BASE}/notifications/vapid-public-key`);
+}
+
+export async function subscribePush(subscription: PushSubscriptionJSON): Promise<{ status: string }> {
+  return apiFetch(`${API_BASE}/notifications/subscribe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(subscription),
+  });
+}
+
+export async function initPushNotifications(): Promise<boolean> {
+  if (typeof window === "undefined" || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+    return false;
+  }
+
+  try {
+    const { push_enabled, vapid_public_key } = await getVapidPublicKey();
+    if (!push_enabled || !vapid_public_key) return false;
+
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return false;
+
+    const reg = await navigator.serviceWorker.ready;
+    const existing = await reg.pushManager.getSubscription();
+
+    const sub = existing ?? await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: vapid_public_key,
+    });
+
+    await subscribePush(sub.toJSON());
+    return true;
+  } catch {
+    return false;
+  }
 }

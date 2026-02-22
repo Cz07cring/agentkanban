@@ -139,6 +139,15 @@ export interface TasksData {
   schema_version?: number;
 }
 
+export interface Project {
+  id: string;
+  name: string;
+  description: string;
+  repo_path: string;
+  created_at: string;
+  task_count: number;
+}
+
 export const KANBAN_COLUMNS: {
   id: TaskStatus;
   label: string;

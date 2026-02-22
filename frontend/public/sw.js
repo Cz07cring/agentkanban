@@ -52,8 +52,8 @@ self.addEventListener("push", (event) => {
   const title = data.title || "Agent Kanban";
   const options = {
     body: data.body || "",
-    icon: "/icons/icon-192.png",
-    badge: "/icons/icon-192.png",
+    icon: "/icons/icon-192.svg",
+    badge: "/icons/icon-192.svg",
     data: data.data || {},
   };
 

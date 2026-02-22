@@ -123,3 +123,16 @@ class FailRequest(BaseModel):
 
 class EventAckRequest(BaseModel):
     by: Optional[str] = None
+
+
+# --- Project models ---
+class ProjectCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="", max_length=2000)
+    repo_path: str = Field(..., min_length=1)
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=2000)
+    repo_path: Optional[str] = None

@@ -12,6 +12,7 @@ import {
   toggleDispatcher,
   triggerDispatch,
 } from "@/lib/api";
+import { useProjectContext } from "@/lib/project-context";
 
 const statusLabels: Record<string, string> = {
   pending: "待开发",
@@ -34,17 +35,19 @@ const statusDot: Record<string, string> = {
 };
 
 export default function DashboardPage() {
+  const { activeProjectId } = useProjectContext();
   const [stats, setStats] = useState<Awaited<ReturnType<typeof fetchStats>> | null>(null);
   const [recentTasks, setRecentTasks] = useState<Task[]>([]);
   const [alerts, setAlerts] = useState<EventRecord[]>([]);
   const [dispatch, setDispatch] = useState<DispatchStatus | null>(null);
 
   useEffect(() => {
+    const pid = activeProjectId;
     const load = async () => {
       const [statsData, tasksData, eventsData, dispatchData] = await Promise.all([
-        fetchStats(),
-        fetchTasks(),
-        fetchEvents(),
+        fetchStats(pid),
+        fetchTasks(undefined, pid),
+        fetchEvents(undefined, pid),
         fetchDispatchStatus().catch(() => null),
       ]);
       setStats(statsData);
@@ -55,7 +58,7 @@ export default function DashboardPage() {
     load().catch(() => undefined);
     const timer = setInterval(() => load().catch(() => undefined), 10000);
     return () => clearInterval(timer);
-  }, []);
+  }, [activeProjectId]);
 
   const handleToggle = async () => {
     const result = await toggleDispatcher().catch(() => null);
