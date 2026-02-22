@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+/* Touch target helper */
+.touch-target {
+  min-height: 40px;
+  min-width: 40px;
+}
+
 /* Mobile responsive overrides */
 @media (max-width: 768px) {
   /* Kanban columns scroll horizontally on mobile */

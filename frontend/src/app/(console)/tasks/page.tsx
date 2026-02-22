@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Engine, Task, TaskStatus, Worker } from "@/lib/types";
 import {
@@ -29,6 +29,12 @@ export default function TasksPage() {
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+
+  const [statusFilter, setStatusFilter] = useState<TaskStatus | "all">("all");
+  const [engineFilter, setEngineFilter] = useState<Engine | "all">("all");
+  const [onlyMine, setOnlyMine] = useState(false);
+  const [onlyFailed, setOnlyFailed] = useState(false);
+  const createFormRef = useRef<HTMLDivElement>(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -161,6 +167,16 @@ export default function TasksPage() {
     }
   }, []);
 
+  const filteredTasks = useMemo(() => {
+    return tasks.filter((task) => {
+      if (statusFilter !== "all" && task.status !== statusFilter) return false;
+      if (engineFilter !== "all" && task.engine !== engineFilter) return false;
+      if (onlyMine && !task.assigned_worker) return false;
+      if (onlyFailed && task.status !== "failed") return false;
+      return true;
+    });
+  }, [tasks, statusFilter, engineFilter, onlyMine, onlyFailed]);
+
   if (loading) {
     return (
       <div className="h-full flex items-center justify-center">
@@ -170,7 +186,7 @@ export default function TasksPage() {
   }
 
   return (
-    <div className="h-full flex flex-col p-4 gap-4">
+    <div className="h-full flex flex-col p-4 gap-4 overflow-y-auto relative">
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <h1 className="text-lg font-semibold">任务看板</h1>
@@ -184,8 +200,67 @@ export default function TasksPage() {
             {connected ? "在线" : "离线"}
           </span>
         </div>
-        <StatsBar tasks={tasks} workers={workers} />
+        <div className="hidden md:block">
+          <StatsBar tasks={filteredTasks} workers={workers} />
+        </div>
       </header>
+
+      <div className="md:hidden sticky top-0 z-20 bg-slate-950/95 border border-slate-800/70 rounded-lg p-3 backdrop-blur-sm space-y-2">
+        <div className="grid grid-cols-2 gap-2">
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as TaskStatus | "all")}
+            className="touch-target bg-slate-900 border border-slate-700/70 rounded-md px-2 py-1.5 text-xs"
+          >
+            <option value="all">全部状态</option>
+            <option value="pending">待开发</option>
+            <option value="in_progress">开发中</option>
+            <option value="plan_review">待审批</option>
+            <option value="blocked_by_subtasks">子任务中</option>
+            <option value="reviewing">待 Review</option>
+            <option value="completed">已完成</option>
+            <option value="failed">失败</option>
+            <option value="cancelled">已取消</option>
+          </select>
+
+          <select
+            value={engineFilter}
+            onChange={(e) => setEngineFilter(e.target.value as Engine | "all")}
+            className="touch-target bg-slate-900 border border-slate-700/70 rounded-md px-2 py-1.5 text-xs"
+          >
+            <option value="all">全部引擎</option>
+            <option value="auto">Auto</option>
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+          </select>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setOnlyMine((v) => !v)}
+            className={`touch-target flex-1 text-xs rounded-md border px-2 py-1.5 ${
+              onlyMine
+                ? "bg-blue-500/20 text-blue-300 border-blue-500/40"
+                : "bg-slate-900 text-slate-400 border-slate-700/70"
+            }`}
+          >
+            仅显示我的
+          </button>
+          <button
+            onClick={() => {
+              const next = !onlyFailed;
+              setOnlyFailed(next);
+              if (next) setStatusFilter("all");
+            }}
+            className={`touch-target flex-1 text-xs rounded-md border px-2 py-1.5 ${
+              onlyFailed
+                ? "bg-red-500/20 text-red-300 border-red-500/40"
+                : "bg-slate-900 text-slate-400 border-slate-700/70"
+            }`}
+          >
+            仅失败任务
+          </button>
+        </div>
+      </div>
 
       {error && (
         <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-2 flex items-center justify-between">
@@ -195,15 +270,17 @@ export default function TasksPage() {
               setError(null);
               loadData();
             }}
-            className="text-xs text-red-400 hover:text-red-300 underline"
+            className="touch-target text-xs text-red-400 hover:text-red-300 underline"
           >
             重试
           </button>
         </div>
       )}
 
-      <TaskCreateForm onSubmit={handleCreateTask} />
-      <KanbanBoard tasks={tasks} onExpandTask={setSelectedTask} />
+      <div ref={createFormRef}>
+        <TaskCreateForm onSubmit={handleCreateTask} />
+      </div>
+      <KanbanBoard tasks={filteredTasks} onExpandTask={setSelectedTask} />
 
       {selectedTask && (
         <TaskDetailPanel
@@ -219,7 +296,14 @@ export default function TasksPage() {
         />
       )}
 
-      <div className="text-xs text-slate-500">
+      <button
+        onClick={() => createFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
+        className="md:hidden touch-target fixed bottom-4 right-4 z-30 rounded-full bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 text-sm font-medium shadow-lg"
+      >
+        + 新增任务
+      </button>
+
+      <div className="text-xs text-slate-500 pb-16 md:pb-0">
         深度审计视图可直接打开: <Link className="underline" href={selectedTask ? `/tasks/${selectedTask.id}` : "/tasks"}>{selectedTask ? selectedTask.id : "任务详情页"}</Link>
       </div>
     </div>
