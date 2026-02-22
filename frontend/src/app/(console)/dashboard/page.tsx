@@ -9,6 +9,7 @@ import {
   fetchEvents,
   fetchStats,
   fetchTasks,
+  mapApiError,
   toggleDispatcher,
   triggerDispatch,
 } from "@/lib/api";
@@ -40,33 +41,60 @@ export default function DashboardPage() {
   const [recentTasks, setRecentTasks] = useState<Task[]>([]);
   const [alerts, setAlerts] = useState<EventRecord[]>([]);
   const [dispatch, setDispatch] = useState<DispatchStatus | null>(null);
+  const [notice, setNotice] = useState<{ message: string; retryLabel: string; onRetry?: () => void } | null>(null);
+  const [toggleLoading, setToggleLoading] = useState(false);
+  const [triggerLoading, setTriggerLoading] = useState(false);
 
   useEffect(() => {
     const pid = activeProjectId;
     const load = async () => {
-      const [statsData, tasksData, eventsData, dispatchData] = await Promise.all([
-        fetchStats(pid),
-        fetchTasks(undefined, pid),
-        fetchEvents(undefined, pid),
-        fetchDispatchStatus().catch(() => null),
-      ]);
-      setStats(statsData);
-      setRecentTasks(tasksData.tasks.slice(0, 8));
-      setAlerts(eventsData.events.filter((e) => ["warning", "error", "critical"].includes(e.level)).slice(0, 6));
-      setDispatch(dispatchData);
+      try {
+        const [statsData, tasksData, eventsData, dispatchData] = await Promise.all([
+          fetchStats(pid),
+          fetchTasks(undefined, pid),
+          fetchEvents(undefined, pid),
+          fetchDispatchStatus().catch(() => null),
+        ]);
+        setStats(statsData);
+        setRecentTasks(tasksData.tasks.slice(0, 8));
+        setAlerts(eventsData.events.filter((e) => ["warning", "error", "critical"].includes(e.level)).slice(0, 6));
+        setDispatch(dispatchData);
+        setNotice(null);
+      } catch (error) {
+        const mapped = mapApiError(error, "仪表盘数据加载失败");
+        setNotice({ message: mapped.message, retryLabel: mapped.retryLabel, onRetry: () => void load() });
+      }
     };
-    load().catch(() => undefined);
-    const timer = setInterval(() => load().catch(() => undefined), 10000);
+    load();
+    const timer = setInterval(() => void load(), 10000);
     return () => clearInterval(timer);
   }, [activeProjectId]);
 
   const handleToggle = async () => {
-    const result = await toggleDispatcher().catch(() => null);
-    if (result) setDispatch((prev) => prev ? { ...prev, enabled: result.enabled } : prev);
+    setToggleLoading(true);
+    try {
+      const result = await toggleDispatcher();
+      setDispatch((prev) => prev ? { ...prev, enabled: result.enabled } : prev);
+      setNotice({ message: `调度器已${result.enabled ? "启动" : "暂停"}`, retryLabel: "关闭提示" });
+    } catch (error) {
+      const mapped = mapApiError(error, "切换调度器失败");
+      setNotice({ message: mapped.message, retryLabel: mapped.retryLabel, onRetry: () => void handleToggle() });
+    } finally {
+      setToggleLoading(false);
+    }
   };
 
   const handleTrigger = async () => {
-    await triggerDispatch().catch(() => undefined);
+    setTriggerLoading(true);
+    try {
+      await triggerDispatch();
+      setNotice({ message: "已触发一次调度", retryLabel: "关闭提示" });
+    } catch (error) {
+      const mapped = mapApiError(error, "触发调度失败");
+      setNotice({ message: mapped.message, retryLabel: mapped.retryLabel, onRetry: () => void handleTrigger() });
+    } finally {
+      setTriggerLoading(false);
+    }
   };
 
   const successRate = stats
@@ -90,6 +118,25 @@ export default function DashboardPage() {
           进入看板
         </Link>
       </header>
+
+
+      {notice && (
+        <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-300 flex items-center justify-between gap-3">
+          <span>{notice.message}</span>
+          <button
+            onClick={() => {
+              if (notice.onRetry) {
+                notice.onRetry();
+              } else {
+                setNotice(null);
+              }
+            }}
+            className="underline hover:text-amber-200"
+          >
+            {notice.retryLabel}
+          </button>
+        </div>
+      )}
 
       {/* Top stats row */}
       <section className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3">
@@ -143,20 +190,22 @@ export default function DashboardPage() {
           </div>
           <div className="mt-3 flex gap-2">
             <button
-              onClick={handleToggle}
-              className={`flex-1 text-xs px-2 py-1.5 rounded-lg border transition-colors ${
+              onClick={() => void handleToggle()}
+              disabled={toggleLoading || triggerLoading}
+              className={`flex-1 text-xs px-2 py-1.5 rounded-lg border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                 dispatch?.enabled
                   ? "bg-amber-500/10 text-amber-400 border-amber-500/20 hover:bg-amber-500/20"
                   : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/20"
               }`}
             >
-              {dispatch?.enabled ? "暂停" : "启动"}
+              {toggleLoading ? "处理中..." : dispatch?.enabled ? "暂停" : "启动"}
             </button>
             <button
-              onClick={handleTrigger}
-              className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500/20 transition-colors"
+              onClick={() => void handleTrigger()}
+              disabled={toggleLoading || triggerLoading}
+              className="flex-1 text-xs px-2 py-1.5 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20 hover:bg-blue-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              立即调度
+              {triggerLoading ? "触发中..." : "立即调度"}
             </button>
           </div>
         </div>
