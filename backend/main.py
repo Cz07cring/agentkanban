@@ -47,8 +47,6 @@ from config import (
     TASKS_FILE,
     WORKER_COOLDOWN_SEC,
     WORKER_EXEC_MODE,
-    WORKTREE_PROVIDER,
-    CLAUDE_WORKTREE_CMD,
     WORKER_HEARTBEAT_TIMEOUT_SEC,
     WORKER_MAX_CONSECUTIVE_FAILURES,
     build_workers,
@@ -89,7 +87,6 @@ from project_service import (
     validate_git_repo,
 )
 from worker_runner import WorkerRunner
-from worktree_provider import ensure_worktree as ensure_worktree_with_provider
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentkanban")
@@ -776,21 +773,31 @@ def _ensure_worktree(worker: dict, repo_path: str | None = None) -> str:
         return str(wt_path)
 
     try:
-        selected = ensure_worktree_with_provider(
-            repo=repo,
-            wt_path=wt_path,
-            branch_name=branch_name,
-            provider=WORKTREE_PROVIDER,
-            claude_worktree_cmd=CLAUDE_WORKTREE_CMD or None,
-            info=logger.info,
-            warning=logger.warning,
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=str(repo), capture_output=True, timeout=10,
         )
-        logger.info("Worktree created for %s at %s (provider=%s)", worker["id"], wt_path, selected)
+        branch_check = subprocess.run(
+            ["git", "rev-parse", "--verify", branch_name],
+            cwd=str(repo), capture_output=True, timeout=10,
+        )
+        if branch_check.returncode == 0:
+            subprocess.run(
+                ["git", "worktree", "add", str(wt_path), branch_name],
+                cwd=str(repo), capture_output=True, check=True, timeout=30,
+            )
+        else:
+            subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, str(wt_path)],
+                cwd=str(repo), capture_output=True, check=True, timeout=30,
+            )
+        logger.info("Worktree created for %s at %s", worker["id"], wt_path)
     except subprocess.CalledProcessError as e:
         logger.warning("Failed to create worktree for %s: %s", worker["id"], e.stderr)
         worker["worktree_path"] = str(repo)
         return str(repo)
-    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+    except (subprocess.SubprocessError, OSError) as exc:
         logger.warning("Failed to create worktree for %s: %s", worker["id"], exc)
         worker["worktree_path"] = str(repo)
         return str(repo)
