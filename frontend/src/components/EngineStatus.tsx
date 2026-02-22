@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { fetchEnginesHealth } from "@/lib/api";
+import { fetchEnginesHealth, mapApiError } from "@/lib/api";
 
 interface EngineStats {
   healthy: boolean;
@@ -12,25 +12,32 @@ interface EngineStats {
 }
 
 export default function EngineStatus() {
-  const [engines, setEngines] = useState<Record<string, EngineStats> | null>(
-    null
-  );
+  const [engines, setEngines] = useState<Record<string, EngineStats> | null>(null);
+  const [fallbackMessage, setFallbackMessage] = useState<string | null>(null);
 
   useEffect(() => {
     const load = async () => {
       try {
         const data = await fetchEnginesHealth();
         setEngines(data.engines);
-      } catch {
-        // silently fail
+        setFallbackMessage(null);
+      } catch (error) {
+        const mapped = mapApiError(error, "状态暂不可用");
+        setFallbackMessage(mapped.message || "状态暂不可用");
       }
     };
-    load();
-    const interval = setInterval(load, 30000);
+    void load();
+    const interval = setInterval(() => void load(), 30000);
     return () => clearInterval(interval);
   }, []);
 
-  if (!engines) return null;
+  if (!engines) {
+    return (
+      <div className="text-xs text-slate-500">
+        {fallbackMessage || "状态暂不可用"}
+      </div>
+    );
+  }
 
   return (
     <div className="flex items-center gap-3">

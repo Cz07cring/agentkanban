@@ -14,7 +14,7 @@ interface TaskCreateFormProps {
     sla_tier: "standard" | "expedite" | "urgent";
     acceptance_criteria: string[];
     rollback_plan: string;
-  }) => void;
+  }) => Promise<void>;
 }
 
 export default function TaskCreateForm({ onSubmit }: TaskCreateFormProps) {
@@ -25,15 +25,17 @@ export default function TaskCreateForm({ onSubmit }: TaskCreateFormProps) {
   const [slaTier, setSlaTier] = useState<"standard" | "expedite" | "urgent">("standard");
   const [acceptanceText, setAcceptanceText] = useState("");
   const [rollbackPlan, setRollbackPlan] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitStatus, setSubmitStatus] = useState<{ type: "creating" | "success" | "error"; message: string } | null>(null);
 
   const dorMissing = useMemo(() => {
     if (!planMode) return false;
     return !acceptanceText.trim() || !rollbackPlan.trim();
   }, [acceptanceText, rollbackPlan, planMode]);
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!trimmed || submitting) return;
 
     const lines = trimmed.split("\n");
     const title = lines[0];
@@ -44,23 +46,34 @@ export default function TaskCreateForm({ onSubmit }: TaskCreateFormProps) {
       .map((item) => item.trim())
       .filter(Boolean);
 
-    onSubmit({
-      title,
-      description: description || title,
-      engine,
-      plan_mode: planMode,
-      risk_level: riskLevel,
-      sla_tier: slaTier,
-      acceptance_criteria: acceptanceCriteria,
-      rollback_plan: rollbackPlan.trim(),
-    });
-    setText("");
+    setSubmitting(true);
+    setSubmitStatus({ type: "creating", message: "任务创建中..." });
+
+    try {
+      await onSubmit({
+        title,
+        description: description || title,
+        engine,
+        plan_mode: planMode,
+        risk_level: riskLevel,
+        sla_tier: slaTier,
+        acceptance_criteria: acceptanceCriteria,
+        rollback_plan: rollbackPlan.trim(),
+      });
+      setText("");
+      setSubmitStatus({ type: "success", message: "任务创建成功" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "任务创建失败，请稍后重试";
+      setSubmitStatus({ type: "error", message });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
-      handleSubmit();
+      void handleSubmit();
     }
   };
 
@@ -81,14 +94,28 @@ export default function TaskCreateForm({ onSubmit }: TaskCreateFormProps) {
         />
         <div className="flex flex-col gap-2 self-end">
           <button
-            onClick={handleSubmit}
-            disabled={!text.trim() || dorMissing}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white text-sm font-medium rounded-lg transition-colors"
+            onClick={() => void handleSubmit()}
+            disabled={!text.trim() || dorMissing || submitting}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white text-sm font-medium rounded-lg transition-colors disabled:cursor-not-allowed"
           >
-            添加
+            {submitting ? "创建中..." : "添加"}
           </button>
         </div>
       </div>
+
+      {submitStatus && (
+        <div
+          className={`mt-3 text-xs px-2.5 py-1.5 rounded border ${
+            submitStatus.type === "success"
+              ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+              : submitStatus.type === "error"
+                ? "bg-red-500/10 border-red-500/30 text-red-300"
+                : "bg-blue-500/10 border-blue-500/30 text-blue-300"
+          }`}
+        >
+          {submitStatus.message}
+        </div>
+      )}
 
       <div className="flex items-center gap-4 mt-3">
         <label className="flex items-center gap-2 cursor-pointer">

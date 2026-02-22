@@ -11,6 +11,7 @@ import {
   dispatchTask,
   fetchTasks,
   fetchWorkers,
+  mapApiError,
   retryTask,
   triggerReview,
   updateTask,
@@ -85,8 +86,11 @@ export default function TasksPage() {
       try {
         const newTask = await createTask(input, activeProjectId);
         setTasks((prev) => (prev.some((t) => t.id === newTask.id) ? prev : [newTask, ...prev]));
+        setError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "创建任务失败");
+        const mapped = mapApiError(err, "创建任务失败");
+        setError(mapped.message);
+        throw new Error(mapped.message);
       }
     },
     [activeProjectId]

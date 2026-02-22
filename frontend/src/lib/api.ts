@@ -2,6 +2,57 @@ import { EventRecord, Project, Task, TaskAttempt, TaskTimelineEntry, TasksData, 
 
 const API_BASE = "/api";
 
+export class ApiError extends Error {
+  status?: number;
+  details?: string;
+  url?: string;
+
+  constructor(message: string, options?: { status?: number; details?: string; url?: string }) {
+    super(message);
+    this.name = "ApiError";
+    this.status = options?.status;
+    this.details = options?.details;
+    this.url = options?.url;
+  }
+}
+
+export interface ErrorPresentation {
+  message: string;
+  retryLabel: string;
+}
+
+export function mapApiError(error: unknown, fallback = "请求失败，请稍后重试"): ErrorPresentation {
+  if (error instanceof ApiError) {
+    if (error.status === 401 || error.status === 403) {
+      return { message: "权限不足，请确认当前账号与项目访问权限", retryLabel: "重新加载" };
+    }
+    if (error.status === 404) {
+      return { message: "目标资源不存在或已被删除", retryLabel: "刷新页面" };
+    }
+    if (error.status === 409) {
+      return { message: "数据已变化，请刷新后重试", retryLabel: "刷新并重试" };
+    }
+    if (error.status === 422) {
+      return { message: error.details || "提交参数不完整或格式错误", retryLabel: "修改后重试" };
+    }
+    if (error.status && error.status >= 500) {
+      return { message: "服务暂时不可用，请稍后重试", retryLabel: "稍后重试" };
+    }
+
+    return { message: error.details || error.message || fallback, retryLabel: "重试" };
+  }
+
+  if (error instanceof TypeError) {
+    return { message: "网络连接异常，请检查网络后重试", retryLabel: "重试" };
+  }
+
+  if (error instanceof Error) {
+    return { message: error.message || fallback, retryLabel: "重试" };
+  }
+
+  return { message: fallback, retryLabel: "重试" };
+}
+
 function projectBase(projectId?: string): string {
   return projectId ? `${API_BASE}/projects/${projectId}` : API_BASE;
 }
@@ -17,10 +68,19 @@ function toQuery(params?: Record<string, string | undefined>): string {
 }
 
 async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch {
+    throw new ApiError("Network request failed", { url });
+  }
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Request failed (${res.status}): ${text || res.statusText}`);
+    throw new ApiError(`Request failed (${res.status})`, {
+      status: res.status,
+      details: text || res.statusText,
+      url,
+    });
   }
   return res.json();
 }
