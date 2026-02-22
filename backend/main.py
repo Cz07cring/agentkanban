@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from filelock import FileLock
 
@@ -47,6 +47,8 @@ from config import (
     TASKS_FILE,
     WORKER_COOLDOWN_SEC,
     WORKER_EXEC_MODE,
+    WORKTREE_PROVIDER,
+    CLAUDE_WORKTREE_CMD,
     WORKER_HEARTBEAT_TIMEOUT_SEC,
     WORKER_MAX_CONSECUTIVE_FAILURES,
     build_workers,
@@ -78,7 +80,16 @@ from notification import (
     get_vapid_public_key,
     send_push_notification,
 )
+from project_service import (
+    ProjectValidationError,
+    ensure_project_can_transition,
+    ensure_project_unique,
+    normalize_project_text,
+    summarize_project_tasks,
+    validate_git_repo,
+)
 from worker_runner import WorkerRunner
+from worktree_provider import ensure_worktree as ensure_worktree_with_provider
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agentkanban")
@@ -314,7 +325,11 @@ def _migrate_to_projects():
                 "name": "默认项目",
                 "description": "从原始数据自动迁移",
                 "repo_path": str(_repo_root()),
+                "status": "active",
                 "created_at": _now(),
+                "updated_at": _now(),
+                "completed_at": None,
+                "archived_at": None,
             }
         ],
     }
@@ -453,6 +468,35 @@ def emit_event(data: dict, event_type: str, *, level: str = "info", task_id: Opt
     if len(data["events"]) > 2000:
         data["events"] = data["events"][-2000:]
     return event
+
+
+
+
+def _sla_rank(task: dict) -> int:
+    return {"urgent": 0, "expedite": 1, "standard": 2}.get(task.get("sla_tier", "standard"), 2)
+
+
+def _validate_task_dor(task: dict) -> None:
+    if not task.get("plan_mode"):
+        return
+    missing: list[str] = []
+    if not (task.get("acceptance_criteria") or []):
+        missing.append("acceptance_criteria")
+    if not (task.get("rollback_plan") or "").strip():
+        missing.append("rollback_plan")
+    if task.get("risk_level") not in {"low", "medium", "high"}:
+        missing.append("risk_level")
+    if missing:
+        raise HTTPException(status_code=409, detail=f"DoR not satisfied: {', '.join(missing)}")
+
+
+def _emit_audit_event(data: dict, action: str, request: Request | None, *, task_id: str | None = None, project_id: str | None = None, meta: dict | None = None) -> dict:
+    actor = "system"
+    if request is not None:
+        actor = request.headers.get("x-actor") or request.headers.get("x-user") or "unknown"
+    payload = dict(meta or {})
+    payload.update({"action": action, "actor": actor, "project_id": project_id})
+    return emit_event(data, "audit", task_id=task_id, message=f"audit:{action}", meta=payload)
 
 
 async def broadcast_task_event(task: dict, event_type: str, project_id: str | None = None):
@@ -716,13 +760,14 @@ WORKTREE_DIR = _repo_root() / ".worktrees"
 
 
 def _ensure_worktree(worker: dict, repo_path: str | None = None) -> str:
-    """Create or validate a git worktree for the given worker. Returns worktree path."""
+    """Create or validate a worktree for the given worker. Returns worktree path."""
     if repo_path:
         repo = Path(repo_path)
         wt_base = repo / ".agent-worktrees"
     else:
         repo = _repo_root()
         wt_base = WORKTREE_DIR
+
     wt_path = wt_base / worker["id"]
     branch_name = f"worker/{worker['id']}"
 
@@ -730,40 +775,23 @@ def _ensure_worktree(worker: dict, repo_path: str | None = None) -> str:
         worker["worktree_path"] = str(wt_path)
         return str(wt_path)
 
-    wt_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Clean up stale worktree entry if directory was deleted but git still tracks it
     try:
-        subprocess.run(
-            ["git", "worktree", "prune"],
-            cwd=str(repo), capture_output=True, timeout=10,
+        selected = ensure_worktree_with_provider(
+            repo=repo,
+            wt_path=wt_path,
+            branch_name=branch_name,
+            provider=WORKTREE_PROVIDER,
+            claude_worktree_cmd=CLAUDE_WORKTREE_CMD or None,
+            info=logger.info,
+            warning=logger.warning,
         )
-    except (subprocess.SubprocessError, OSError):
-        pass
-
-    # Check if branch already exists
-    branch_check = subprocess.run(
-        ["git", "rev-parse", "--verify", branch_name],
-        cwd=str(repo), capture_output=True, timeout=10,
-    )
-
-    try:
-        if branch_check.returncode == 0:
-            # Branch exists, add worktree with existing branch
-            subprocess.run(
-                ["git", "worktree", "add", str(wt_path), branch_name],
-                cwd=str(repo), capture_output=True, check=True, timeout=30,
-            )
-        else:
-            # Create new branch
-            subprocess.run(
-                ["git", "worktree", "add", "-b", branch_name, str(wt_path)],
-                cwd=str(repo), capture_output=True, check=True, timeout=30,
-            )
-        logger.info("Worktree created for %s at %s", worker["id"], wt_path)
+        logger.info("Worktree created for %s at %s (provider=%s)", worker["id"], wt_path, selected)
     except subprocess.CalledProcessError as e:
         logger.warning("Failed to create worktree for %s: %s", worker["id"], e.stderr)
-        # Fallback to repo root
+        worker["worktree_path"] = str(repo)
+        return str(repo)
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        logger.warning("Failed to create worktree for %s: %s", worker["id"], exc)
         worker["worktree_path"] = str(repo)
         return str(repo)
 
@@ -1373,6 +1401,10 @@ async def create_task(body: TaskCreate):
         "plan_mode": body.plan_mode,
         "plan_content": None,
         "plan_questions": [q.model_dump() for q in body.plan_questions],
+        "risk_level": body.risk_level,
+        "sla_tier": body.sla_tier,
+        "acceptance_criteria": body.acceptance_criteria,
+        "rollback_plan": body.rollback_plan,
         "assigned_worker": None,
         "worktree_branch": None,
         "review_status": None,
@@ -1493,6 +1525,7 @@ async def delete_task(task_id: str):
 
     data["tasks"] = [t for t in data.get("tasks", []) if t.get("id") != task_id]
     event = emit_event(data, "task_deleted", task_id=task_id, message=f"Task {task_id} deleted")
+    _emit_audit_event(data, "task_deleted", None, task_id=task_id)
     write_tasks(data)
 
     await ws_manager.broadcast({"type": "task_deleted", "task_id": task_id})
@@ -1525,6 +1558,7 @@ async def dispatch_next(body: DispatchRequest):
 
     candidates.sort(
         key=lambda x: (
+            _sla_rank(x),
             PRIORITY_ORDER.get(x.get("priority", "medium"), 1),
             x.get("created_at", ""),
         )
@@ -1955,14 +1989,14 @@ async def submit_review(task_id: str, body: ReviewResult):
     return task
 
 
-@app.post("/api/tasks/{task_id}/approve-plan")
-async def _approve_plan_impl(task_id: str, body: PlanApproval, project_id: str | None = None):
+async def _approve_plan_impl(task_id: str, body: PlanApproval, project_id: str | None = None, request: Request | None = None):
     data = read_tasks(project_id)
     task = find_task(data, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     if task.get("status") != "plan_review":
         raise HTTPException(status_code=409, detail="Task is not in plan_review status")
+    _validate_task_dor(task)
 
     if not body.approved:
         task["status"] = "pending"
@@ -1971,6 +2005,7 @@ async def _approve_plan_impl(task_id: str, body: PlanApproval, project_id: str |
             task["plan_content"] = f"{prev}\n\n--- 驳回反馈 ---\n{body.feedback}".strip()
         add_timeline(task, "plan_rejected", {"feedback": body.feedback or ""})
         event = emit_event(data, "plan_rejected", task_id=task_id, message="Plan rejected")
+        _emit_audit_event(data, "plan_rejected", request, task_id=task_id, project_id=project_id)
         write_tasks(data, project_id)
         await broadcast_task_event(task, "task_updated", project_id)
         await broadcast_event(event)
@@ -2035,6 +2070,7 @@ async def _approve_plan_impl(task_id: str, body: PlanApproval, project_id: str |
         message="Plan approved and decomposed",
         meta={"sub_task_count": len(created_subs)},
     )
+    _emit_audit_event(data, "plan_approved", request, task_id=task_id, project_id=project_id, meta={"sub_task_count": len(created_subs)})
 
     write_tasks(data, project_id)
 
@@ -2045,8 +2081,9 @@ async def _approve_plan_impl(task_id: str, body: PlanApproval, project_id: str |
     return {"task": task, "sub_tasks": created_subs}
 
 
-async def approve_plan(task_id: str, body: PlanApproval):
-    return await _approve_plan_impl(task_id, body)
+@app.post("/api/tasks/{task_id}/approve-plan")
+async def approve_plan(task_id: str, body: PlanApproval, request: Request):
+    return await _approve_plan_impl(task_id, body, request=request)
 
 
 async def _decompose_task_impl(task_id: str, body: DecomposeRequest, project_id: str | None = None):
@@ -2279,46 +2316,143 @@ async def get_push_public_key():
 
 
 # --- Project CRUD ---
+
+def _generate_project_init_ai_payload(requirement: str) -> dict:
+    req = (requirement or "").strip()
+    lowered = req.lower()
+
+    platform = "移动端" if any(k in req for k in ["移动", "手机", "微信"]) else ("Web" if "web" in lowered else "Web + 移动端")
+    speed_pref = any(k in req for k in ["尽快", "快速", "马上", "mvp"])
+
+    questions = [
+        {"id": "goal", "question": "你当前最看重什么？", "options": ["尽快上线", "稳定可靠", "可扩展"]},
+        {"id": "scope", "question": "首版范围建议？", "options": [f"仅{platform}", f"{platform}核心闭环", "完整闭环 + 监控"]},
+        {"id": "risk", "question": "风险偏好？", "options": ["保守", "平衡", "激进"]},
+        {"id": "qa", "question": "验收方式？", "options": ["最小可用验收", "业务场景验收", "覆盖率+场景双验收"]},
+    ]
+
+    option_a = {
+        "key": "A",
+        "title": "AI方案A（快速闭环）",
+        "summary": f"围绕“{req[:40] or '当前需求'}”先交付 {platform} 最小闭环，再小步迭代。",
+        "cycle": "5~7天" if speed_pref else "7~10天",
+        "risk": "中",
+        "acceptance": [
+            "支持需求输入并生成候选执行方案",
+            "支持选择后进入任务执行流",
+            "关键链路可回归验证"
+        ],
+    }
+    option_b = {
+        "key": "B",
+        "title": "AI方案B（平衡落地）",
+        "summary": f"先完善需求建立与评审体验，再推进自动化执行，降低返工。",
+        "cycle": "10~14天",
+        "risk": "低",
+        "acceptance": [
+            "需求建立信息完整率提升",
+            "方案可编辑并可自然语言补充",
+            "端到端流程可稳定运行"
+        ],
+    }
+    option_c = {
+        "key": "C",
+        "title": "AI方案C（长期演进）",
+        "summary": "引入评分矩阵与复盘，构建从需求到交付的长期优化闭环。",
+        "cycle": "2~4周",
+        "risk": "中",
+        "acceptance": [
+            "方案质量可量化评估",
+            "交付后可复盘并反哺模板",
+            "支持持续迭代扩展"
+        ],
+    }
+
+    return {
+        "source": "ai_local_fallback",
+        "questions": questions,
+        "options": [option_a, option_b, option_c],
+        "suggested_option": "A" if speed_pref else "B",
+    }
+
+
+@app.post("/api/projects/init-assistant")
+async def project_init_assistant(body: dict[str, str]):
+    requirement = (body.get("requirement") or "").strip()
+    if not requirement:
+        raise HTTPException(status_code=400, detail="requirement is required")
+    payload = _generate_project_init_ai_payload(requirement)
+    return payload
+
+@app.post("/api/projects/validate-repo")
+async def validate_project_repo(body: dict[str, str]):
+    repo_path = body.get("repo_path", "")
+    try:
+        repo = validate_git_repo(repo_path)
+    except ProjectValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    branch = None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            branch = (proc.stdout or "").strip() or None
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+    return {"valid": True, "repo_path": str(repo), "default_branch": branch}
+
+
 @app.get("/api/projects")
 async def list_projects():
     data = read_projects()
-    projects = data.get("projects", [])
-    # Enrich with task_count
-    for proj in projects:
+    enriched: list[dict] = []
+    for proj in data.get("projects", []):
+        item = dict(proj)
         try:
             pdata = read_tasks(proj["id"])
-            proj["task_count"] = len(pdata.get("tasks", []))
+            summary = summarize_project_tasks(pdata.get("tasks", []))
+            item["task_count"] = summary["total"]
+            item["task_summary"] = summary
         except Exception:
-            proj["task_count"] = 0
-    return {"projects": projects}
+            item["task_count"] = 0
+            item["task_summary"] = summarize_project_tasks([])
+        enriched.append(item)
+    return {"projects": enriched}
 
 
 @app.post("/api/projects")
 async def create_project(body: ProjectCreate):
-    repo = Path(body.repo_path)
-    if not repo.exists():
-        raise HTTPException(status_code=400, detail="repo_path does not exist")
-
-    # Validate it's a git repo
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--git-dir"],
-            capture_output=True, timeout=10,
-        )
-        if result.returncode != 0:
-            raise HTTPException(status_code=400, detail="repo_path is not a git repository")
-    except (subprocess.SubprocessError, OSError):
-        raise HTTPException(status_code=400, detail="Failed to validate git repository")
+        name, description, repo_path = normalize_project_text(body.name, body.description, body.repo_path)
+        repo = validate_git_repo(repo_path)
+    except ProjectValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     data = read_projects()
+    try:
+        ensure_project_unique(data.get("projects", []), name=name, repo_path=str(repo))
+    except ProjectValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     pid = _gen_project_id(data)
 
     project = {
         "id": pid,
-        "name": body.name,
-        "description": body.description,
-        "repo_path": str(repo.resolve()),
+        "name": name,
+        "description": description,
+        "repo_path": str(repo),
+        "status": body.status,
+        "init_brief": body.init_brief,
         "created_at": _now(),
+        "updated_at": _now(),
+        "completed_at": None,
+        "archived_at": None,
     }
     data.setdefault("projects", []).append(project)
     write_projects(data)
@@ -2337,9 +2471,12 @@ async def get_project(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
     try:
         pdata = read_tasks(project_id)
-        proj["task_count"] = len(pdata.get("tasks", []))
+        summary = summarize_project_tasks(pdata.get("tasks", []))
+        proj["task_count"] = summary["total"]
+        proj["task_summary"] = summary
     except Exception:
         proj["task_count"] = 0
+        proj["task_summary"] = summarize_project_tasks([])
     return proj
 
 
@@ -2350,15 +2487,60 @@ async def update_project(project_id: str, body: ProjectUpdate):
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    next_name = proj.get("name", "")
+    next_desc = proj.get("description", "")
+    next_repo = proj.get("repo_path", "")
+    next_status = proj.get("status", "active")
+
     if body.name is not None:
-        proj["name"] = body.name
+        next_name = body.name.strip()
     if body.description is not None:
-        proj["description"] = body.description
+        next_desc = body.description.strip()
     if body.repo_path is not None:
-        repo = Path(body.repo_path)
-        if not repo.exists():
-            raise HTTPException(status_code=400, detail="repo_path does not exist")
-        proj["repo_path"] = str(repo.resolve())
+        try:
+            next_repo = str(validate_git_repo(body.repo_path))
+        except ProjectValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.status is not None:
+        next_status = body.status
+
+    if not next_name:
+        raise HTTPException(status_code=400, detail="project name is required")
+
+    try:
+        ensure_project_unique(
+            data.get("projects", []),
+            name=next_name,
+            repo_path=next_repo,
+            ignore_project_id=project_id,
+        )
+    except ProjectValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
+        pdata = read_tasks(project_id)
+        task_summary = summarize_project_tasks(pdata.get("tasks", []))
+    except Exception:
+        task_summary = summarize_project_tasks([])
+
+    try:
+        ensure_project_can_transition(proj.get("status", "active"), next_status, task_summary)
+    except ProjectValidationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    proj["name"] = next_name
+    proj["description"] = next_desc
+    proj["repo_path"] = str(Path(next_repo).resolve())
+    proj["status"] = next_status
+    proj["updated_at"] = _now()
+    if next_status == "completed" and not proj.get("completed_at"):
+        proj["completed_at"] = _now()
+    if next_status != "completed":
+        proj["completed_at"] = None
+    if next_status == "archived" and not proj.get("archived_at"):
+        proj["archived_at"] = _now()
+    if next_status != "archived":
+        proj["archived_at"] = None
 
     write_projects(data)
     return proj
@@ -2377,11 +2559,11 @@ async def delete_project(project_id: str):
     # Check for active tasks
     try:
         pdata = read_tasks(project_id)
-        active = [t for t in pdata.get("tasks", []) if t.get("status") in {"in_progress", "reviewing"}]
-        if active:
-            raise HTTPException(status_code=409, detail="Project has active tasks")
+        task_summary = summarize_project_tasks(pdata.get("tasks", []))
     except Exception:
-        pass
+        task_summary = summarize_project_tasks([])
+    if task_summary["active"] > 0:
+        raise HTTPException(status_code=409, detail="Project has active tasks")
 
     data["projects"] = [p for p in data.get("projects", []) if p["id"] != project_id]
     write_projects(data)
@@ -2456,6 +2638,10 @@ async def create_project_task(project_id: str, body: TaskCreate):
         "plan_mode": body.plan_mode,
         "plan_content": None,
         "plan_questions": [q.model_dump() for q in body.plan_questions],
+        "risk_level": body.risk_level,
+        "sla_tier": body.sla_tier,
+        "acceptance_criteria": body.acceptance_criteria,
+        "rollback_plan": body.rollback_plan,
         "assigned_worker": None,
         "worktree_branch": None,
         "review_status": None,
@@ -2577,11 +2763,11 @@ async def delete_project_task(project_id: str, task_id: str):
 
 
 @app.post("/api/projects/{project_id}/tasks/{task_id}/approve-plan")
-async def approve_project_plan(project_id: str, task_id: str, body: PlanApproval):
+async def approve_project_plan(project_id: str, task_id: str, body: PlanApproval, request: Request):
     proj_data = read_projects()
     if not _find_project(proj_data, project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    return await _approve_plan_impl(task_id, body, project_id)
+    return await _approve_plan_impl(task_id, body, project_id, request=request)
 
 
 @app.post("/api/projects/{project_id}/tasks/{task_id}/decompose")

@@ -59,6 +59,10 @@ export interface Task {
   plan_mode: boolean;
   plan_content: string | null;
   plan_questions: PlanQuestion[];
+  risk_level?: "low" | "medium" | "high";
+  sla_tier?: "standard" | "expedite" | "urgent";
+  acceptance_criteria?: string[];
+  rollback_plan?: string | null;
   assigned_worker: string | null;
   worktree_branch: string | null;
   review_status: string | null;
@@ -139,6 +143,24 @@ export interface TasksData {
   schema_version?: number;
 }
 
+export interface ProjectInitOption {
+  id: "A" | "B" | "C";
+  title: string;
+  summary: string;
+  timeline: string;
+  risk: string;
+  acceptance_criteria: string[];
+}
+
+export interface ProjectInitBrief {
+  raw_requirement: string;
+  clarification_answers: Array<{ question_id: string; answer: string }>;
+  options: ProjectInitOption[];
+  selected_option: "A" | "B" | "C";
+  generated_brief_markdown: string;
+  extra_context?: string;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -146,6 +168,7 @@ export interface Project {
   repo_path: string;
   created_at: string;
   task_count: number;
+  init_brief?: ProjectInitBrief | null;
 }
 
 export const KANBAN_COLUMNS: {

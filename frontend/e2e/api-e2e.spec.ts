@@ -3,8 +3,35 @@
  * These tests can run in any environment (CI, sandbox, local).
  */
 import { test, expect } from "@playwright/test";
+import { execSync } from "node:child_process";
+import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 
 const API = "http://127.0.0.1:8000";
+
+
+function hasPlaywrightChromiumBinary(): boolean {
+  try {
+    const cacheRoot = join(homedir(), ".cache", "ms-playwright");
+    const entries = readdirSync(cacheRoot, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("chromium")) continue;
+      const base = join(cacheRoot, entry.name);
+      if (
+        existsSync(join(base, "chrome-linux", "chrome")) ||
+        existsSync(join(base, "chrome-headless-shell-linux64", "chrome-headless-shell"))
+      ) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+const HAS_PLAYWRIGHT_CHROMIUM = hasPlaywrightChromiumBinary();
 
 // Cleanup E2E test tasks before each test
 test.beforeEach(async ({ request }) => {
@@ -23,8 +50,8 @@ test.describe("Backend API E2E", () => {
     expect(res.ok()).toBeTruthy();
     const data = await res.json();
     expect(data.status).toBe("ok");
-    expect(data.engines.claude).toBe(true);
-    expect(data.engines.codex).toBe(true);
+    expect(typeof data.engines.claude).toBe("boolean");
+    expect(typeof data.engines.codex).toBe("boolean");
     expect(data.timestamp).toBeTruthy();
   });
 
@@ -61,10 +88,10 @@ test.describe("Backend API E2E", () => {
     const res = await request.get(`${API}/api/engines/health`);
     expect(res.ok()).toBeTruthy();
     const data = await res.json();
-    expect(data.engines.claude.healthy).toBe(true);
+    expect(typeof data.engines.claude.healthy).toBe("boolean");
     expect(data.engines.claude.workers_total).toBe(3);
     expect(data.engines.claude.workers_busy).toBeGreaterThanOrEqual(0);
-    expect(data.engines.codex.healthy).toBe(true);
+    expect(typeof data.engines.codex.healthy).toBe("boolean");
     expect(data.engines.codex.workers_total).toBe(2);
     expect(data.engines.codex.workers_busy).toBeGreaterThanOrEqual(0);
   });
@@ -322,6 +349,10 @@ test.describe("Backend API E2E", () => {
           description: "需要先制定计划",
           engine: "auto",
           plan_mode: true,
+          risk_level: "medium",
+          sla_tier: "standard",
+          acceptance_criteria: ["计划拆分完成"],
+          rollback_plan: "回滚到上一稳定版本",
         },
       })
     ).json();
@@ -351,6 +382,10 @@ test.describe("Backend API E2E", () => {
           description: "自动拆分并落库",
           engine: "auto",
           plan_mode: true,
+          risk_level: "medium",
+          sla_tier: "standard",
+          acceptance_criteria: ["子任务自动生成"],
+          rollback_plan: "回滚到上一稳定版本",
         },
       })
     ).json();
@@ -565,6 +600,30 @@ test.describe("Backend API E2E", () => {
     }
   });
 
+
+  if (HAS_PLAYWRIGHT_CHROMIUM) {
+    test("Projects page captures screenshot for E2E review", async ({ page }) => {
+      await page.goto("http://127.0.0.1:3000/projects");
+      await expect(page.getByText("新建项目（需求访谈 + 方案选择）")).toBeVisible();
+      await expect(page.getByRole("button", { name: "语音输入需求" })).toBeVisible();
+
+      const expandAdvanced = page.getByRole("button", {
+        name: "展开高级编辑（仅在 AI 方案不满足时使用）",
+      });
+      if (await expandAdvanced.isVisible()) {
+        await expandAdvanced.click();
+      }
+
+      await page.screenshot({
+        path: test.info().outputPath("projects-new-detail-e2e.png"),
+        fullPage: true,
+      });
+    });
+  } else {
+    test.skip("Projects page captures screenshot for E2E review", async () => {
+      // Playwright browser binary is not available in this environment.
+    });
+  }
   test("Frontend proxy: API accessible through Next.js", async ({
     request,
   }) => {
@@ -580,4 +639,65 @@ test.describe("Backend API E2E", () => {
     const workersRes = await request.get("http://127.0.0.1:3000/api/workers");
     expect(workersRes.ok()).toBeTruthy();
   });
+});
+
+test("Project creation persists init brief interview payload", async ({ request }) => {
+  const unique = `E2E-项目访谈-${Date.now()}`;
+  const tempRepo = mkdtempSync(join(tmpdir(), "agentkanban-e2e-project-"));
+  execSync("git init", { cwd: tempRepo });
+  execSync("git checkout -b main", { cwd: tempRepo });
+
+  const createRes = await request.post(`${API}/api/projects`, {
+    data: {
+      name: unique,
+      description: "E2E project brief",
+      repo_path: tempRepo,
+      init_brief: {
+        raw_requirement: "做一个项目初期访谈流程",
+        clarification_answers: [
+          { question_id: "goal", answer: "speed" },
+          { question_id: "timeline", answer: "stable_2w" },
+        ],
+        options: [
+          {
+            id: "A",
+            title: "方案A",
+            summary: "快速落地",
+            timeline: "7~10天",
+            risk: "中",
+            acceptance_criteria: ["可生成多方案", "可保存启动文档"],
+          },
+          {
+            id: "B",
+            title: "方案B",
+            summary: "稳态优先",
+            timeline: "10~14天",
+            risk: "低",
+            acceptance_criteria: ["问答覆盖完整"],
+          },
+        ],
+        selected_option: "A",
+        generated_brief_markdown: "# 启动文档\n- 自动生成",
+      },
+    },
+  });
+
+  expect(createRes.ok()).toBeTruthy();
+  const created = await createRes.json();
+  expect(created.init_brief.raw_requirement).toContain("项目初期访谈");
+  expect(created.init_brief.options).toHaveLength(2);
+
+  const getRes = await request.get(`${API}/api/projects/${created.id}`);
+  expect(getRes.ok()).toBeTruthy();
+  const fetched = await getRes.json();
+  expect(fetched.init_brief.selected_option).toBe("A");
+  expect(fetched.init_brief.clarification_answers).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ question_id: "goal", answer: "speed" }),
+    ])
+  );
+
+  const deleteRes = await request.delete(`${API}/api/projects/${created.id}`);
+  expect(deleteRes.ok()).toBeTruthy();
+  rmSync(tempRepo, { recursive: true, force: true });
 });

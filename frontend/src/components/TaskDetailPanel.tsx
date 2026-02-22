@@ -175,6 +175,14 @@ export default function TaskDetailPanel({
               <div className="mt-1 text-slate-300">{task.task_type}</div>
             </div>
             <div>
+              <span className="text-slate-500">风险等级</span>
+              <div className="mt-1 text-slate-300">{task.risk_level || "-"}</div>
+            </div>
+            <div>
+              <span className="text-slate-500">SLA</span>
+              <div className="mt-1 text-slate-300">{task.sla_tier || "standard"}</div>
+            </div>
+            <div>
               <span className="text-slate-500">创建时间</span>
               <div className="mt-1 text-slate-300">
                 {new Date(task.created_at).toLocaleString("zh-CN")}
@@ -230,6 +238,11 @@ export default function TaskDetailPanel({
               {task.plan_content && (
                 <div className="p-2 bg-slate-800/50 rounded text-xs text-slate-300 whitespace-pre-wrap max-h-40 overflow-y-auto">
                   {task.plan_content}
+                </div>
+              )}
+              {task.plan_mode && ((task.acceptance_criteria?.length ?? 0) === 0 || !task.rollback_plan) && (
+                <div className="p-2 bg-amber-500/10 border border-amber-500/30 rounded text-xs text-amber-300">
+                  当前任务缺少 DoR 字段（验收标准/回滚方案），后端将阻止 Plan 审批。请先补全任务信息。
                 </div>
               )}
               {!showRejectInput ? (
