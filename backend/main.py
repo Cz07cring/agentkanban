@@ -1380,6 +1380,13 @@ async def list_tasks(
 @app.post("/api/tasks")
 async def create_task(body: TaskCreate):
     data = read_tasks()
+
+    # Validate depends_on references
+    if body.depends_on:
+        for dep_id in body.depends_on:
+            if not find_task(data, dep_id):
+                raise HTTPException(status_code=400, detail=f"Dependency task not found: {dep_id}")
+
     task_id = gen_task_id(data)
 
     task_type = body.task_type or classify_task_type(body.title, body.description)
@@ -1522,6 +1529,20 @@ async def delete_task(task_id: str):
     for t in data.get("tasks", []):
         if task_id in (t.get("depends_on") or []):
             raise HTTPException(status_code=409, detail="Task is referenced by dependencies")
+
+    # Release assigned worker if task is in progress
+    assigned = task.get("assigned_worker")
+    if assigned and task.get("status") == "in_progress":
+        worker = _worker_by_id(assigned)
+        if worker and worker.get("current_task_id") == task_id:
+            _release_worker(worker)
+
+    # Clean up parent's sub_tasks reference
+    parent_id = task.get("parent_task_id")
+    if parent_id:
+        parent = find_task(data, parent_id)
+        if parent and task_id in (parent.get("sub_tasks") or []):
+            parent["sub_tasks"] = [s for s in parent["sub_tasks"] if s != task_id]
 
     data["tasks"] = [t for t in data.get("tasks", []) if t.get("id") != task_id]
     event = emit_event(data, "task_deleted", task_id=task_id, message=f"Task {task_id} deleted")
@@ -2167,15 +2188,16 @@ async def _retry_task_impl(task_id: str, project_id: str | None = None):
         raise HTTPException(status_code=404, detail="Task not found")
     if task.get("status") != "failed":
         raise HTTPException(status_code=409, detail="Only failed tasks can be retried")
-    if task.get("retry_count", 0) >= task.get("max_retries", 3):
-        raise HTTPException(status_code=409, detail="Max retries exceeded")
 
+    # Manual retry resets retry_count so the task can be re-dispatched
+    # even if it previously exhausted automatic retries.
     task["status"] = "pending"
+    task["retry_count"] = 0
     task["error_log"] = None
     task["assigned_worker"] = None
     task["started_at"] = None
     task["blocked_reason"] = None
-    add_timeline(task, "task_retried", {"retry_count": task.get("retry_count", 0)})
+    add_timeline(task, "task_retried", {"retry_count": task.get("retry_count", 0), "manual": True})
 
     event = emit_event(data, "retry_scheduled", task_id=task_id, message="Retry scheduled")
     write_tasks(data, project_id)
@@ -2617,6 +2639,13 @@ async def create_project_task(project_id: str, body: TaskCreate):
         raise HTTPException(status_code=404, detail="Project not found")
 
     data = read_tasks(project_id)
+
+    # Validate depends_on references
+    if body.depends_on:
+        for dep_id in body.depends_on:
+            if not find_task(data, dep_id):
+                raise HTTPException(status_code=400, detail=f"Dependency task not found: {dep_id}")
+
     task_id = gen_task_id(data)
 
     task_type = body.task_type or classify_task_type(body.title, body.description)
@@ -2736,10 +2765,16 @@ async def update_project_task(project_id: str, task_id: str, body: TaskUpdate):
     if "engine" in updates or "task_type" in updates:
         task["routed_engine"] = route_task(task)
 
+    review_task = None
+    if task.get("status") == "completed":
+        review_task = maybe_trigger_adversarial_review(task, data)
+
     _refresh_parent_rollup(data)
     write_tasks(data, project_id)
 
     await broadcast_task_event(task, "task_updated", project_id=project_id)
+    if review_task:
+        await broadcast_task_event(review_task, "task_created", project_id=project_id)
     return task
 
 
@@ -2753,6 +2788,20 @@ async def delete_project_task(project_id: str, task_id: str):
     for t in data.get("tasks", []):
         if task_id in (t.get("depends_on") or []):
             raise HTTPException(status_code=409, detail="Task is referenced by dependencies")
+
+    # Release assigned worker if task is in progress
+    assigned = task.get("assigned_worker")
+    if assigned and task.get("status") == "in_progress":
+        worker = _worker_by_id(assigned)
+        if worker and worker.get("current_task_id") == task_id:
+            _release_worker(worker)
+
+    # Clean up parent's sub_tasks reference
+    parent_id = task.get("parent_task_id")
+    if parent_id:
+        parent = find_task(data, parent_id)
+        if parent and task_id in (parent.get("sub_tasks") or []):
+            parent["sub_tasks"] = [s for s in parent["sub_tasks"] if s != task_id]
 
     data["tasks"] = [t for t in data.get("tasks", []) if t.get("id") != task_id]
     emit_event(data, "task_deleted", task_id=task_id, message=f"Task {task_id} deleted")
