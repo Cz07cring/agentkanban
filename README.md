@@ -79,6 +79,10 @@ npm run dev -- --port 3000
 - 默认端口：Claude 5200-5202，Codex 5203-5204。
 - 每个 Worker 独立 worktree，`data/`、`CLAUDE.md`/`codex.md` 用 symlink 共享。
 - 完成任务后遵循 CLAUDE.md / codex.md 的提交与合并流程。
+- 可选启用官方/外部 Worktree 集成：
+  - `WORKTREE_PROVIDER=git`（默认，内置 `git worktree`）
+  - `WORKTREE_PROVIDER=claude` + `CLAUDE_WORKTREE_CMD`（调用外部命令模板，要求包含 `{repo}` `{path}` `{branch}` 三个占位符，失败自动回退到 `git`）
+  - `WORKTREE_PROVIDER=auto`（有 `CLAUDE_WORKTREE_CMD` 时优先 `claude`，否则走 `git`）
 
 ## 后台 API 与调度要点
 - `POST /api/tasks`：创建任务，Plan 任务初始状态为 `plan_review`。

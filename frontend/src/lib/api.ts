@@ -57,6 +57,10 @@ export async function createTask(input: {
   engine: string;
   plan_mode: boolean;
   priority?: "high" | "medium" | "low";
+  risk_level?: "low" | "medium" | "high";
+  sla_tier?: "standard" | "expedite" | "urgent";
+  acceptance_criteria?: string[];
+  rollback_plan?: string;
 }, projectId?: string): Promise<Task> {
   const base = projectBase(projectId);
   return apiFetch<Task>(`${base}/tasks`, {
@@ -393,6 +397,7 @@ export async function createProject(input: {
   name: string;
   description: string;
   repo_path: string;
+  init_brief?: Project["init_brief"];
 }): Promise<Project> {
   return apiFetch<Project>(`${API_BASE}/projects`, {
     method: "POST",
@@ -415,6 +420,35 @@ export async function updateProject(
 export async function deleteProject(projectId: string): Promise<void> {
   await apiFetch<{ deleted: string }>(`${API_BASE}/projects/${projectId}`, {
     method: "DELETE",
+  });
+}
+
+export async function validateProjectRepo(repo_path: string): Promise<{ valid: boolean; repo_path: string; default_branch: string | null }> {
+  return apiFetch(`${API_BASE}/projects/validate-repo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ repo_path }),
+  });
+}
+
+
+export async function generateProjectInitAssistant(requirement: string): Promise<{
+  source: string;
+  suggested_option: "A" | "B" | "C";
+  questions: Array<{ id: string; question: string; options: string[] }>;
+  options: Array<{
+    key: "A" | "B" | "C";
+    title: string;
+    summary: string;
+    cycle: string;
+    risk: string;
+    acceptance: string[];
+  }>;
+}> {
+  return apiFetch(`${API_BASE}/projects/init-assistant`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ requirement }),
   });
 }
 

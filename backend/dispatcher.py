@@ -10,6 +10,10 @@ from typing import Any, Callable
 logger = logging.getLogger("agentkanban.dispatcher")
 
 
+def _sla_rank(task: dict) -> int:
+    return {"urgent": 0, "expedite": 1, "standard": 2}.get(task.get("sla_tier", "standard"), 2)
+
+
 class DispatchRuntime:
     """Single source-of-truth dispatcher runtime.
 
@@ -142,7 +146,7 @@ class DispatchRuntime:
             task["routed_engine"] = routed
             pending.append(task)
 
-        pending.sort(key=lambda t: ({"high": 0, "medium": 1, "low": 2}.get(t.get("priority", "medium"), 1), t.get("created_at", "")))
+        pending.sort(key=lambda t: (_sla_rank(t), {"high": 0, "medium": 1, "low": 2}.get(t.get("priority", "medium"), 1), t.get("created_at", "")))
 
         for task in pending:
             engine = task.get("routed_engine") or self.route_task(task)

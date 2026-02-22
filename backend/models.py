@@ -1,7 +1,7 @@
 """Agent Kanban - Pydantic request/response models."""
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,10 @@ class TaskCreate(BaseModel):
     task_type: Optional[Literal["feature", "bugfix", "review", "refactor", "analysis", "plan", "audit"]] = None
     depends_on: list[str] = Field(default_factory=list)
     plan_questions: list[PlanQuestion] = Field(default_factory=list)
+    risk_level: Literal["low", "medium", "high"] = "medium"
+    sla_tier: Literal["standard", "expedite", "urgent"] = "standard"
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    rollback_plan: Optional[str] = None
 
 
 class TaskUpdate(BaseModel):
@@ -49,6 +53,10 @@ class TaskUpdate(BaseModel):
     plan_mode: Optional[bool] = None
     plan_content: Optional[str] = None
     plan_questions: Optional[list[PlanQuestion]] = None
+    risk_level: Optional[Literal["low", "medium", "high"]] = None
+    sla_tier: Optional[Literal["standard", "expedite", "urgent"]] = None
+    acceptance_criteria: Optional[list[str]] = None
+    rollback_plan: Optional[str] = None
     assigned_worker: Optional[str] = None
     error_log: Optional[str] = None
     commit_ids: Optional[list[str]] = None
@@ -130,9 +138,12 @@ class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: str = Field(default="", max_length=2000)
     repo_path: str = Field(..., min_length=1)
+    status: Literal["draft", "active", "on_hold"] = "draft"
+    init_brief: Optional[dict[str, Any]] = None
 
 
 class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=100)
     description: Optional[str] = Field(default=None, max_length=2000)
     repo_path: Optional[str] = None
+    status: Optional[Literal["draft", "active", "on_hold", "completed", "archived"]] = None
