@@ -2346,6 +2346,158 @@ async def get_push_public_key():
 
 # --- Project CRUD ---
 
+
+def _build_init_assistant_prompt(requirement: str) -> str:
+    """Build a prompt for Claude CLI to generate project init assistant payload."""
+    return (
+        "你是一个专业的软件项目规划助手。用户将给出一个项目需求描述，你需要：\n"
+        "1. 生成 4 个澄清问题（goal/scope/risk/qa），每个问题提供 3 个选项\n"
+        "2. 生成 3 个实施方案 A/B/C（分别代表快速闭环、平衡落地、长期演进）\n"
+        "3. 根据需求推荐一个最合适的方案\n\n"
+        f"用户需求: {requirement}\n\n"
+        "请在回答末尾用 ```json ``` 包裹一个严格符合以下 schema 的 JSON 块：\n"
+        "```json\n"
+        "{\n"
+        '  "questions": [\n'
+        '    {"id": "goal", "question": "你当前最看重什么？", "options": ["选项1", "选项2", "选项3"]},\n'
+        '    {"id": "scope", "question": "首版范围建议？", "options": ["选项1", "选项2", "选项3"]},\n'
+        '    {"id": "risk", "question": "风险偏好？", "options": ["选项1", "选项2", "选项3"]},\n'
+        '    {"id": "qa", "question": "验收方式？", "options": ["选项1", "选项2", "选项3"]}\n'
+        "  ],\n"
+        '  "options": [\n'
+        "    {\n"
+        '      "key": "A",\n'
+        '      "title": "AI方案A（快速闭环）",\n'
+        '      "summary": "方案概要...",\n'
+        '      "cycle": "预估周期",\n'
+        '      "risk": "风险等级",\n'
+        '      "acceptance": ["验收标准1", "验收标准2", "验收标准3"]\n'
+        "    },\n"
+        '    {"key": "B", "title": "AI方案B（平衡落地）", "summary": "...", "cycle": "...", "risk": "...", "acceptance": ["..."]},\n'
+        '    {"key": "C", "title": "AI方案C（长期演进）", "summary": "...", "cycle": "...", "risk": "...", "acceptance": ["..."]}\n'
+        "  ],\n"
+        '  "suggested_option": "A"\n'
+        "}\n"
+        "```\n\n"
+        "要求：\n"
+        "- questions 中每个问题的 options 必须是 3 个具体的、与用户需求相关的选项\n"
+        "- 3 个方案必须贴合用户实际需求，不要泛泛而谈\n"
+        "- suggested_option 必须是 A/B/C 之一\n"
+        "- JSON 必须是合法的，可直接解析\n"
+        "- 只输出一个 JSON 块"
+    )
+
+
+def _parse_init_assistant_json(text: str) -> dict | None:
+    """Extract and validate init-assistant JSON from Claude CLI output.
+
+    Reuses the same regex pattern as _parse_review_json() — looks for the
+    last ```json ... ``` fenced block.
+    Returns the parsed dict on success, None on any validation failure.
+    """
+    pattern = r"```json\s*\n?(.*?)\n?\s*```"
+    matches = re.findall(pattern, text, re.DOTALL)
+    if not matches:
+        logger.warning("init-assistant output missing JSON block")
+        return None
+    try:
+        obj = json.loads(matches[-1])
+    except (json.JSONDecodeError, AttributeError) as exc:
+        logger.warning("init-assistant JSON parse failed: %s", exc)
+        return None
+
+    # Validate questions
+    questions = obj.get("questions")
+    if not isinstance(questions, list) or len(questions) == 0:
+        logger.warning("init-assistant: questions missing or empty")
+        return None
+    for q in questions:
+        if not isinstance(q, dict):
+            return None
+        if not all(k in q for k in ("id", "question", "options")):
+            logger.warning("init-assistant: question missing required fields: %s", q)
+            return None
+        if not isinstance(q["options"], list) or len(q["options"]) == 0:
+            logger.warning("init-assistant: question options empty")
+            return None
+
+    # Validate options (schemes A/B/C)
+    options = obj.get("options")
+    if not isinstance(options, list) or len(options) == 0:
+        logger.warning("init-assistant: options missing or empty")
+        return None
+    required_option_fields = ("key", "title", "summary", "cycle", "risk", "acceptance")
+    for opt in options:
+        if not isinstance(opt, dict):
+            return None
+        if not all(k in opt for k in required_option_fields):
+            logger.warning("init-assistant: option missing required fields: %s", opt.get("key", "?"))
+            return None
+
+    # Validate suggested_option
+    suggested = obj.get("suggested_option")
+    if suggested not in ("A", "B", "C"):
+        logger.warning("init-assistant: invalid suggested_option=%s", suggested)
+        return None
+
+    return obj
+
+
+async def _call_claude_for_init_assistant(requirement: str) -> dict | None:
+    """Call Claude CLI to generate init-assistant payload.
+
+    Returns the parsed payload dict with source='claude_cli' on success,
+    or None on any failure (triggers fallback to rule engine).
+    """
+    if not ENGINE_HEALTH.get("claude", False):
+        logger.info("init-assistant: Claude engine unhealthy, skipping CLI call")
+        return None
+    if not shutil.which(CLAUDE_CLI):
+        logger.info("init-assistant: Claude CLI not found at %s", CLAUDE_CLI)
+        return None
+
+    prompt = _build_init_assistant_prompt(requirement)
+    cmd = [
+        CLAUDE_CLI,
+        "-p",
+        prompt,
+        "--dangerously-skip-permissions",
+        "--output-format",
+        "text",
+    ]
+    logger.info("init-assistant: calling Claude CLI for requirement: %.80s...", requirement)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=WorkerRunner._clean_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_raw, stderr_raw = await asyncio.wait_for(
+            proc.communicate(), timeout=45.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("init-assistant: Claude CLI timed out (45s)")
+        return None
+    except OSError as exc:
+        logger.warning("init-assistant: failed to spawn Claude CLI: %s", exc)
+        return None
+
+    if proc.returncode != 0:
+        stderr_text = (stderr_raw or b"").decode(errors="replace")[:500]
+        logger.warning("init-assistant: Claude CLI exited %d: %s", proc.returncode, stderr_text)
+        return None
+
+    stdout_text = (stdout_raw or b"").decode(errors="replace")
+    payload = _parse_init_assistant_json(stdout_text)
+    if payload is None:
+        logger.warning("init-assistant: failed to parse Claude CLI output")
+        return None
+
+    payload["source"] = "claude_cli"
+    return payload
+
+
 def _generate_project_init_ai_payload(requirement: str) -> dict:
     req = (requirement or "").strip()
     lowered = req.lower()
@@ -2410,7 +2562,10 @@ async def project_init_assistant(body: dict[str, str]):
     requirement = (body.get("requirement") or "").strip()
     if not requirement:
         raise HTTPException(status_code=400, detail="requirement is required")
-    payload = _generate_project_init_ai_payload(requirement)
+    # Try Claude CLI first, fall back to rule engine
+    payload = await _call_claude_for_init_assistant(requirement)
+    if payload is None:
+        payload = _generate_project_init_ai_payload(requirement)
     return payload
 
 @app.post("/api/projects/validate-repo")
