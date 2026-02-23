@@ -1163,6 +1163,7 @@ async def _fail_task_internal(task_id: str, *, worker_id: str, lease_id: Optiona
     _complete_attempt(task, False, exit_code=exit_code, error_log=error_log, commit_ids=[])
 
     worker["health"]["consecutive_failures"] += 1
+    _release_worker(worker)
 
     # Detect rate-limit errors and use a much longer retry delay
     is_rate_limited = error_log and ("rate_limit" in error_log or "hit your limit" in error_log)
@@ -1537,12 +1538,18 @@ async def delete_task(task_id: str):
         if task_id in (t.get("depends_on") or []):
             raise HTTPException(status_code=409, detail="Task is referenced by dependencies")
 
-    # Release assigned worker if task is in progress
+    # Release any worker still bound to this task (by assigned_worker or current_task_id)
     assigned = task.get("assigned_worker")
-    if assigned and task.get("status") == "in_progress":
+    if assigned:
         worker = _worker_by_id(assigned)
         if worker and worker.get("current_task_id") == task_id:
             _release_worker(worker)
+    else:
+        # assigned_worker may have been cleared by auto-retry; scan workers
+        for w in WORKERS:
+            if w.get("current_task_id") == task_id:
+                _release_worker(w)
+                break
 
     # Clean up parent's sub_tasks reference
     parent_id = task.get("parent_task_id")
@@ -2951,12 +2958,17 @@ async def delete_project_task(project_id: str, task_id: str):
         if task_id in (t.get("depends_on") or []):
             raise HTTPException(status_code=409, detail="Task is referenced by dependencies")
 
-    # Release assigned worker if task is in progress
+    # Release any worker still bound to this task (by assigned_worker or current_task_id)
     assigned = task.get("assigned_worker")
-    if assigned and task.get("status") == "in_progress":
+    if assigned:
         worker = _worker_by_id(assigned)
         if worker and worker.get("current_task_id") == task_id:
             _release_worker(worker)
+    else:
+        for w in WORKERS:
+            if w.get("current_task_id") == task_id:
+                _release_worker(w)
+                break
 
     # Clean up parent's sub_tasks reference
     parent_id = task.get("parent_task_id")
