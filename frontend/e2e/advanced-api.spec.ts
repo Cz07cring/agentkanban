@@ -247,6 +247,8 @@ test.describe("Plan Approval & Decomposition", () => {
         description: "完整计划流程",
         engine: "auto",
         plan_mode: true,
+        acceptance_criteria: ["API 接口可用", "测试通过"],
+        rollback_plan: "回滚到上一版本",
       },
     });
     const task = await taskRes.json();
@@ -296,6 +298,8 @@ test.describe("Plan Approval & Decomposition", () => {
         description: "测试驳回流程",
         engine: "auto",
         plan_mode: true,
+        acceptance_criteria: ["设计完成"],
+        rollback_plan: "回滚到上一版本",
       },
     });
     const task = await taskRes.json();
@@ -520,7 +524,7 @@ test.describe("Review Flow", () => {
     const parentRes = await request.get(`${API}/api/tasks/${task.id}`);
     const parent = await parentRes.json();
     expect(parent.review_status).toBe("changes_requested");
-    expect(parent.status).toBe("failed");
+    expect(parent.status).toBe("pending");
     expect(parent.review_round).toBe(1);
   });
 
@@ -775,7 +779,7 @@ test.describe("Retry Endpoint", () => {
     expect(retryRes.status()).toBe(409);
   });
 
-  test("Retry with max retries exceeded returns 409", async ({ request }) => {
+  test("Manual retry resets retry_count even at max retries", async ({ request }) => {
     const taskRes = await request.post(`${API}/api/tasks`, {
       data: {
         title: "ADV-超出最大重试",
@@ -799,10 +803,14 @@ test.describe("Retry Endpoint", () => {
       },
     });
 
+    // Manual retry always succeeds — resets retry_count for re-dispatch
     const retryRes = await request.post(
       `${API}/api/tasks/${task.id}/retry`,
     );
-    expect(retryRes.status()).toBe(409);
+    expect(retryRes.ok()).toBeTruthy();
+    const retried = await retryRes.json();
+    expect(retried.status).toBe("pending");
+    expect(retried.retry_count).toBe(0);
   });
 });
 
@@ -1389,5 +1397,120 @@ test.describe("Dependency Management", () => {
       `${API}/api/tasks/${parent.id}`,
     );
     expect(deleteRes.status()).toBe(409);
+  });
+});
+
+// ─── Project Init Assistant (Claude CLI integration) ────────────────────────
+
+test.describe("Project Init Assistant", () => {
+  test("POST /api/projects/init-assistant returns valid payload", async ({
+    request,
+  }) => {
+    const res = await request.post(`${API}/api/projects/init-assistant`, {
+      data: { requirement: "做一个电商小程序" },
+    });
+    expect(res.ok()).toBeTruthy();
+    const data = await res.json();
+
+    // Must have source field (claude_cli or ai_local_fallback)
+    expect(["claude_cli", "ai_local_fallback"]).toContain(data.source);
+
+    // Validate questions structure
+    expect(data.questions).toBeInstanceOf(Array);
+    expect(data.questions.length).toBeGreaterThanOrEqual(1);
+    for (const q of data.questions) {
+      expect(q.id).toBeDefined();
+      expect(q.question).toBeDefined();
+      expect(q.options).toBeInstanceOf(Array);
+      expect(q.options.length).toBeGreaterThanOrEqual(1);
+    }
+
+    // Validate options (A/B/C schemes)
+    expect(data.options).toBeInstanceOf(Array);
+    expect(data.options.length).toBeGreaterThanOrEqual(1);
+    for (const opt of data.options) {
+      expect(opt.key).toBeDefined();
+      expect(opt.title).toBeDefined();
+      expect(opt.summary).toBeDefined();
+      expect(opt.cycle).toBeDefined();
+      expect(opt.risk).toBeDefined();
+      expect(opt.acceptance).toBeInstanceOf(Array);
+    }
+
+    // Validate suggested_option
+    expect(["A", "B", "C"]).toContain(data.suggested_option);
+  });
+
+  test("POST /api/projects/init-assistant rejects empty requirement", async ({
+    request,
+  }) => {
+    const res = await request.post(`${API}/api/projects/init-assistant`, {
+      data: { requirement: "" },
+    });
+    expect(res.status()).toBe(400);
+  });
+
+  test("POST /api/projects/init-assistant rejects missing requirement", async ({
+    request,
+  }) => {
+    const res = await request.post(`${API}/api/projects/init-assistant`, {
+      data: {},
+    });
+    expect(res.status()).toBe(400);
+  });
+
+  test("init-assistant response matches frontend TypeScript contract", async ({
+    request,
+  }) => {
+    const res = await request.post(`${API}/api/projects/init-assistant`, {
+      data: { requirement: "开发一个任务管理系统" },
+    });
+    expect(res.ok()).toBeTruthy();
+    const data = await res.json();
+
+    // Verify exact field types matching api.ts:495 contract
+    expect(typeof data.source).toBe("string");
+    expect(typeof data.suggested_option).toBe("string");
+
+    // questions: Array<{ id: string; question: string; options: string[] }>
+    for (const q of data.questions) {
+      expect(typeof q.id).toBe("string");
+      expect(typeof q.question).toBe("string");
+      for (const opt of q.options) {
+        expect(typeof opt).toBe("string");
+      }
+    }
+
+    // options: Array<{ key, title, summary, cycle, risk, acceptance: string[] }>
+    for (const opt of data.options) {
+      expect(typeof opt.key).toBe("string");
+      expect(typeof opt.title).toBe("string");
+      expect(typeof opt.summary).toBe("string");
+      expect(typeof opt.cycle).toBe("string");
+      expect(typeof opt.risk).toBe("string");
+      for (const a of opt.acceptance) {
+        expect(typeof a).toBe("string");
+      }
+    }
+  });
+
+  test("init-assistant with different requirements returns relevant content", async ({
+    request,
+  }) => {
+    const res = await request.post(`${API}/api/projects/init-assistant`, {
+      data: { requirement: "搭建一个博客系统，支持 Markdown 编辑和评论功能" },
+    });
+    expect(res.ok()).toBeTruthy();
+    const data = await res.json();
+
+    // Should have 3 options (A/B/C)
+    expect(data.options.length).toBe(3);
+    const keys = data.options.map((o: any) => o.key);
+    expect(keys).toContain("A");
+    expect(keys).toContain("B");
+    expect(keys).toContain("C");
+
+    // Questions should cover the 4 standard dimensions
+    expect(data.questions.length).toBeGreaterThanOrEqual(4);
   });
 });
